@@ -363,3 +363,92 @@ def evaluate_tracking(gt_data, pred_data, iou_threshold=0.5):
         "ratio_ids": ratio_ids,
         "switches_per_gt": switches_per_gt
     }
+
+
+def run_unit_tests(verbose: bool = True):
+    """
+    Parte 0 (Item 3) - Testes unitarios construidos a mao:
+
+    (a) Predicao == Ground Truth  =>  IDF1 = 1.0  e  ID Switches = 0
+    (b) Duas identidades trocadas a partir do quadro k=11  =>  2 switches, IDF1 = 0.5
+    (c) Uma track partida em dois IDs distintos (objeto fragmentado)
+        =>  1 switch, IDF1 = 0.5, unique_pred_ids = 2 (GT tem 1)
+
+    Nota: (b) e (c) tem IDF1 igual mas causas diferentes:
+    (b) confusao entre dois objetos => contagem correta, identidades trocadas
+    (c) fragmentacao de um objeto   => contagem inflada, um objeto virou dois IDs
+    """
+    SEP = "=" * 65
+    if verbose:
+        print(SEP)
+        print("PARTE 0 (Item 3) - TESTES UNITARIOS DAS METRICAS")
+        print(SEP)
+
+    all_passed = True
+
+    # --- CASO (a): Predicao identica ao GT ---
+    gt_a, pred_a = {}, {}
+    for f in range(1, 21):
+        gt_a[f] = {
+            1: np.array([10 + f, 10 + f, 20, 40], dtype=np.float32),
+            2: np.array([80 - f, 60 - f, 20, 40], dtype=np.float32),
+        }
+        pred_a[f] = {k: v.copy() for k, v in gt_a[f].items()}
+
+    res_a = evaluate_tracking(gt_a, pred_a)
+    ok_a = np.isclose(res_a["idf1"], 1.0) and res_a["id_switches"] == 0
+    all_passed = all_passed and ok_a
+    if verbose:
+        print(f"\n{'[PASS]' if ok_a else '[FAIL]'} Caso (a) -- Predicao == Ground Truth")
+        print(f"       IDF1        = {res_a['idf1']:.4f}  (esperado: 1.0000)")
+        print(f"       ID Switches = {res_a['id_switches']}  (esperado: 0)")
+
+    # --- CASO (b): Duas identidades trocadas a partir do frame k=11 ---
+    gt_b = {f: {k: v.copy() for k, v in gt_a[f].items()} for f in gt_a}
+    pred_b = {}
+    for f in range(1, 21):
+        if f < 11:
+            pred_b[f] = {k: v.copy() for k, v in gt_a[f].items()}
+        else:
+            pred_b[f] = {1: gt_a[f][2].copy(), 2: gt_a[f][1].copy()}
+
+    res_b = evaluate_tracking(gt_b, pred_b)
+    ok_b = np.isclose(res_b["idf1"], 0.5, atol=0.01) and res_b["id_switches"] == 2
+    all_passed = all_passed and ok_b
+    if verbose:
+        print(f"\n{'[PASS]' if ok_b else '[FAIL]'} Caso (b) -- Troca de 2 identidades a partir de k=11")
+        print(f"       IDF1        = {res_b['idf1']:.4f}  (esperado: ~0.5000)")
+        print(f"       ID Switches = {res_b['id_switches']}  (esperado: 2)")
+        print("       DIAGNOSTICO: tracker CONFUNDIU identidades dos dois objetos")
+
+    # --- CASO (c): Track unica partida em dois IDs ---
+    gt_c = {f: {1: np.array([10 + f, 20 + f, 20, 30], dtype=np.float32)}
+            for f in range(1, 21)}
+    pred_c = {}
+    for f in range(1, 11):
+        pred_c[f] = {1: gt_c[f][1].copy()}
+    for f in range(11, 21):
+        pred_c[f] = {2: gt_c[f][1].copy()}
+
+    res_c = evaluate_tracking(gt_c, pred_c)
+    ok_c = (np.isclose(res_c["idf1"], 0.5, atol=0.01)
+            and res_c["id_switches"] == 1
+            and res_c["unique_pred_ids"] == 2
+            and res_c["unique_gt_ids"] == 1)
+    all_passed = all_passed and ok_c
+    if verbose:
+        print(f"\n{'[PASS]' if ok_c else '[FAIL]'} Caso (c) -- Track unica fragmentada em 2 IDs")
+        print(f"       IDF1           = {res_c['idf1']:.4f}  (esperado: ~0.5000)")
+        print(f"       ID Switches    = {res_c['id_switches']}  (esperado: 1)")
+        print(f"       IDs GT / Pred  = {res_c['unique_gt_ids']} GT / {res_c['unique_pred_ids']} Pred")
+        print("       DIAGNOSTICO: contagem INFLADA (2 IDs pred para 1 objeto real)")
+        print("\n       Diferenca entre (b) e (c):")
+        print("       (b) 2 objetos trocados   => switches=2, qtd de IDs correta")
+        print("       (c) 1 objeto fragmentado => switches=1, qtd de IDs inflada")
+
+    if verbose:
+        print(f"\n{SEP}")
+        print("TODOS OS TESTES APROVADOS!" if all_passed else "ATENCAO: ALGUM TESTE FALHOU!")
+        print(SEP)
+
+    return all_passed
