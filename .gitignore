@@ -1,0 +1,24 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+# Large Data & Checkpoints
+data/MOT17/
+data/synthetic/
+checkpoints/*.pt
+!checkpoints/.gitkeep
