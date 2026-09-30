@@ -22,3 +22,8 @@ data/MOT17/
 data/synthetic/
 checkpoints/*.pt
 !checkpoints/.gitkeep
+
+.venv
+
+data/MOT17/
+data/

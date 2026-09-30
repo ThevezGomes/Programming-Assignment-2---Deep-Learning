@@ -1,1 +1,365 @@
-# metrics.py
+"""
+src/metrics.py
+Implementação de métricas de tracking e NMS de autoria própria:
+- custom_nms: Implementação própria sem usar torchvision.ops.nms
+- calculate_iou e box_iou_matrix: Cálculo de IoU entre caixas [x, y, w, h]
+- compute_idf1: IDF1 oficial (Ristani et al., 2016) via Hungarian matching global
+- compute_id_switches_and_fragmentations: Contagem explícita de switches e fragmentações
+- compute_map_per_frame: mAP de detecção por quadro para o gráfico de descolamento
+- evaluate_tracking: Avaliação completa de trajetórias
+"""
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+
+def calculate_iou(box1, box2):
+    """
+    Calcula IoU entre duas caixas no formato [x, y, w, h] (top-left, width, height).
+    """
+    x1_min, y1_min = box1[0], box1[1]
+    x1_max, y1_max = box1[0] + box1[2], box1[1] + box1[3]
+
+    x2_min, y2_min = box2[0], box2[1]
+    x2_max, y2_max = box2[0] + box2[2], box2[1] + box2[3]
+
+    inter_xmin = max(x1_min, x2_min)
+    inter_ymin = max(y1_min, y2_min)
+    inter_xmax = min(x1_max, x2_max)
+    inter_ymax = min(y1_max, y2_max)
+
+    inter_w = max(0.0, inter_xmax - inter_xmin)
+    inter_h = max(0.0, inter_ymax - inter_ymin)
+    inter_area = inter_w * inter_h
+
+    area1 = max(0.0, box1[2]) * max(0.0, box1[3])
+    area2 = max(0.0, box2[2]) * max(0.0, box2[3])
+
+    union_area = area1 + area2 - inter_area
+    if union_area <= 0.0:
+        return 0.0
+
+    return inter_area / union_area
+
+
+def box_iou_matrix(boxes_a, boxes_b):
+    """
+    Calcula a matriz de IoU entre N caixas e M caixas.
+    boxes_a: (N, 4) no formato [x, y, w, h]
+    boxes_b: (M, 4) no formato [x, y, w, h]
+    Retorna: (N, M)
+    """
+    if len(boxes_a) == 0 or len(boxes_b) == 0:
+        return np.zeros((len(boxes_a), len(boxes_b)), dtype=np.float32)
+
+    boxes_a = np.asarray(boxes_a, dtype=np.float32)
+    boxes_b = np.asarray(boxes_b, dtype=np.float32)
+
+    a_x1, a_y1 = boxes_a[:, 0], boxes_a[:, 1]
+    a_x2, a_y2 = boxes_a[:, 0] + boxes_a[:, 2], boxes_a[:, 1] + boxes_a[:, 3]
+
+    b_x1, b_y1 = boxes_b[:, 0], boxes_b[:, 1]
+    b_x2, b_y2 = boxes_b[:, 0] + boxes_b[:, 2], boxes_b[:, 1] + boxes_b[:, 3]
+
+    inter_x1 = np.maximum(a_x1[:, None], b_x1[None, :])
+    inter_y1 = np.maximum(a_y1[:, None], b_y1[None, :])
+    inter_x2 = np.minimum(a_x2[:, None], b_x2[None, :])
+    inter_y2 = np.minimum(a_y2[:, None], b_y2[None, :])
+
+    inter_w = np.maximum(0.0, inter_x2 - inter_x1)
+    inter_h = np.maximum(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+
+    area_a = boxes_a[:, 2] * boxes_a[:, 3]
+    area_b = boxes_b[:, 2] * boxes_b[:, 3]
+    union_area = area_a[:, None] + area_b[None, :] - inter_area
+
+    iou = np.where(union_area > 0, inter_area / np.maximum(union_area, 1e-7), 0.0)
+    return iou
+
+
+def custom_nms(boxes, scores, iou_threshold=0.5):
+    """
+    Implementação própria de NMS sem torchvision.ops.nms.
+    boxes: array-like (N, 4) no formato [x, y, w, h]
+    scores: array-like (N,)
+    iou_threshold: limiar de corte
+    Retorna: lista de índices mantidos
+    """
+    if len(boxes) == 0:
+        return []
+
+    boxes = np.asarray(boxes, dtype=np.float32)
+    scores = np.asarray(scores, dtype=np.float32)
+
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 0] + boxes[:, 2]
+    y2 = boxes[:, 1] + boxes[:, 3]
+    areas = np.maximum(0.0, boxes[:, 2]) * np.maximum(0.0, boxes[:, 3])
+
+    order = scores.argsort()[::-1]
+    keep = []
+
+    while order.size > 0:
+        i = order[0]
+        keep.append(int(i))
+        if order.size == 1:
+            break
+
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+
+        ovr = inter / (areas[i] + areas[order[1:]] - inter + 1e-7)
+        inds = np.where(ovr <= iou_threshold)[0]
+        order = order[inds + 1]
+
+    return keep
+
+
+def compute_idf1(gt_data, pred_data, iou_threshold=0.5):
+    """
+    Calcula IDF1 oficial (Ristani et al., 2016) via Hungarian matching global.
+    gt_data: dict {frame: {id: [x, y, w, h]}} ou list/array de [frame, id, x, y, w, h]
+    pred_data: dict {frame: {id: [x, y, w, h]}} ou list/array de [frame, id, x, y, w, h]
+    """
+    def _to_dict(d):
+        if isinstance(d, dict):
+            return d
+        out = {}
+        for row in d:
+            f, tid = int(row[0]), int(row[1])
+            box = np.asarray(row[2:6], dtype=np.float32)
+            if f not in out:
+                out[f] = {}
+            out[f][tid] = box
+        return out
+
+    gt_dict = _to_dict(gt_data)
+    pred_dict = _to_dict(pred_data)
+
+    gt_ids = sorted(list({tid for f in gt_dict.values() for tid in f.keys()}))
+    pred_ids = sorted(list({tid for f in pred_dict.values() for tid in f.keys()}))
+
+    n_gt = len(gt_ids)
+    n_pred = len(pred_ids)
+
+    total_gt = sum(len(f) for f in gt_dict.values())
+    total_pred = sum(len(f) for f in pred_dict.values())
+
+    if total_gt == 0 and total_pred == 0:
+        return {"idf1": 1.0, "idp": 1.0, "idr": 1.0, "idtp": 0, "idfp": 0, "idfn": 0}
+    if total_gt == 0 or total_pred == 0 or n_gt == 0 or n_pred == 0:
+        return {"idf1": 0.0, "idp": 0.0, "idr": 0.0, "idtp": 0, "idfp": total_pred, "idfn": total_gt}
+
+    gt_to_idx = {gid: i for i, gid in enumerate(gt_ids)}
+    pred_to_idx = {pid: j for j, pid in enumerate(pred_ids)}
+
+    # Matriz de sobreposição C[i, j] = frames onde GT i casa com Pred j com IoU >= iou_threshold
+    cost_matrix = np.zeros((n_gt, n_pred), dtype=np.float32)
+
+    all_frames = set(gt_dict.keys()).union(set(pred_dict.keys()))
+    for f in all_frames:
+        gts = gt_dict.get(f, {})
+        preds = pred_dict.get(f, {})
+        if not gts or not preds:
+            continue
+
+        f_gt_ids = list(gts.keys())
+        f_pred_ids = list(preds.keys())
+        f_gt_boxes = np.array([gts[gid] for gid in f_gt_ids])
+        f_pred_boxes = np.array([preds[pid] for pid in f_pred_ids])
+
+        ious = box_iou_matrix(f_gt_boxes, f_pred_boxes)
+        r_ind, c_ind = linear_sum_assignment(-ious)
+        for r, c in zip(r_ind, c_ind):
+            if ious[r, c] >= iou_threshold:
+                gid = f_gt_ids[r]
+                pid = f_pred_ids[c]
+                cost_matrix[gt_to_idx[gid], pred_to_idx[pid]] += 1.0
+
+    # Matching global entre trajetórias
+    row_ind, col_ind = linear_sum_assignment(-cost_matrix)
+    idtp = int(sum(cost_matrix[r, c] for r, c in zip(row_ind, col_ind)))
+
+    idfp = total_pred - idtp
+    idfn = total_gt - idtp
+    denom = 2 * idtp + idfp + idfn
+    idf1 = float(2 * idtp / denom) if denom > 0 else 0.0
+    idp = float(idtp / total_pred) if total_pred > 0 else 0.0
+    idr = float(idtp / total_gt) if total_gt > 0 else 0.0
+
+    return {
+        "idf1": idf1,
+        "idp": idp,
+        "idr": idr,
+        "idtp": idtp,
+        "idfp": idfp,
+        "idfn": idfn
+    }
+
+
+def compute_id_switches_and_fragmentations(gt_data, pred_data, iou_threshold=0.5):
+    """
+    Contagem de trocas de identidade (ID switches) e fragmentações (quebras na track).
+    """
+    def _to_dict(d):
+        if isinstance(d, dict):
+            return d
+        out = {}
+        for row in d:
+            f, tid = int(row[0]), int(row[1])
+            box = np.asarray(row[2:6], dtype=np.float32)
+            if f not in out:
+                out[f] = {}
+            out[f][tid] = box
+        return out
+
+    gt_dict = _to_dict(gt_data)
+    pred_dict = _to_dict(pred_data)
+
+    all_frames = sorted(list(set(gt_dict.keys()).union(set(pred_dict.keys()))))
+
+    last_pred = {}
+    last_frame = {}
+    id_switches = 0
+    fragmentations = 0
+
+    for f in all_frames:
+        gts = gt_dict.get(f, {})
+        preds = pred_dict.get(f, {})
+        f_matches = {}
+
+        if gts and preds:
+            f_gt_ids = list(gts.keys())
+            f_pred_ids = list(preds.keys())
+            f_gt_boxes = np.array([gts[gid] for gid in f_gt_ids])
+            f_pred_boxes = np.array([preds[pid] for pid in f_pred_ids])
+
+            ious = box_iou_matrix(f_gt_boxes, f_pred_boxes)
+            r_ind, c_ind = linear_sum_assignment(-ious)
+            for r, c in zip(r_ind, c_ind):
+                if ious[r, c] >= iou_threshold:
+                    f_matches[f_gt_ids[r]] = f_pred_ids[c]
+
+        for gid in gts.keys():
+            if gid in f_matches:
+                curr_pred = f_matches[gid]
+                if gid in last_pred:
+                    if curr_pred != last_pred[gid]:
+                        id_switches += 1
+                    if f > last_frame[gid] + 1:
+                        fragmentations += 1
+                last_pred[gid] = curr_pred
+                last_frame[gid] = f
+
+    return {
+        "id_switches": id_switches,
+        "fragmentations": fragmentations
+    }
+
+
+def compute_map_per_frame(gt_dict, det_dict, iou_threshold=0.5):
+    """
+    Calcula Average Precision (AP) por quadro para avaliar a qualidade pura do detector
+    (usado no Painel de Descolamento da Parte 1).
+    """
+    all_frames = sorted(list(set(gt_dict.keys()).union(set(det_dict.keys()))))
+    frame_aps = []
+
+    for f in all_frames:
+        gts = gt_dict.get(f, {})
+        dets = det_dict.get(f, [])
+
+        n_gt = len(gts)
+        if n_gt == 0:
+            continue
+
+        if len(dets) == 0:
+            frame_aps.append(0.0)
+            continue
+
+        # dets: list of (box, score) ordenados por score decrescente
+        if isinstance(dets, dict):
+            det_boxes = [dets[k] for k in dets]
+            det_scores = [1.0] * len(det_boxes)
+        elif len(dets) > 0 and len(dets[0]) >= 6:
+            # Formato [frame, id, x, y, w, h, conf]
+            det_boxes = [d[2:6] for d in dets]
+            det_scores = [d[6] if len(d) > 6 else 1.0 for d in dets]
+        else:
+            det_boxes = [d[:4] for d in dets]
+            det_scores = [1.0] * len(det_boxes)
+
+        order = np.argsort(det_scores)[::-1]
+        det_boxes = np.array(det_boxes)[order]
+
+        gt_boxes = np.array(list(gts.values()))
+        matched_gt = set()
+
+        tp = np.zeros(len(det_boxes))
+        fp = np.zeros(len(det_boxes))
+
+        ious = box_iou_matrix(det_boxes, gt_boxes)
+        for i in range(len(det_boxes)):
+            best_iou = 0.0
+            best_gt = -1
+            for j in range(len(gt_boxes)):
+                if j not in matched_gt and ious[i, j] > best_iou:
+                    best_iou = ious[i, j]
+                    best_gt = j
+            if best_iou >= iou_threshold and best_gt != -1:
+                tp[i] = 1.0
+                matched_gt.add(best_gt)
+            else:
+                fp[i] = 1.0
+
+        cum_tp = np.cumsum(tp)
+        cum_fp = np.cumsum(fp)
+        prec = cum_tp / (cum_tp + cum_fp + 1e-7)
+        rec = cum_tp / n_gt
+
+        # 11-point interpolation or area under curve
+        ap = 0.0
+        for t in np.arange(0.0, 1.1, 0.1):
+            p = np.max(prec[rec >= t]) if np.sum(rec >= t) > 0 else 0.0
+            ap += p / 11.0
+        frame_aps.append(ap)
+
+    return float(np.mean(frame_aps)) if frame_aps else 0.0
+
+
+def evaluate_tracking(gt_data, pred_data, iou_threshold=0.5):
+    """
+    Avaliação consolidada de uma sequência de rastreamento.
+    """
+    idf1_res = compute_idf1(gt_data, pred_data, iou_threshold)
+    idsw_res = compute_id_switches_and_fragmentations(gt_data, pred_data, iou_threshold)
+
+    def _get_unique(d):
+        if isinstance(d, dict):
+            return len({tid for f in d.values() for tid in f.keys()})
+        return len(np.unique([int(r[1]) for r in d])) if len(d) > 0 else 0
+
+    unique_gt = _get_unique(gt_data)
+    unique_pred = _get_unique(pred_data)
+    ratio_ids = (unique_pred / unique_gt) if unique_gt > 0 else 0.0
+    switches_per_gt = (idsw_res["id_switches"] / unique_gt) if unique_gt > 0 else 0.0
+
+    return {
+        "idf1": idf1_res["idf1"],
+        "idp": idf1_res["idp"],
+        "idr": idf1_res["idr"],
+        "id_switches": idsw_res["id_switches"],
+        "fragmentations": idsw_res["fragmentations"],
+        "unique_gt_ids": unique_gt,
+        "unique_pred_ids": unique_pred,
+        "ratio_ids": ratio_ids,
+        "switches_per_gt": switches_per_gt
+    }
