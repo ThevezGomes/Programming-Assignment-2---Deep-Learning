@@ -4,7 +4,7 @@ O objetivo deste repositório é atender aos requisitos do Programming Assignmen
 
 ## Integrantes do Grupo
 * Henrique Gabriel Gasparelo
-* [Nome do Colega de Dupla]
+* José Thevez Gomes Guedes
 
 ---
 
@@ -102,6 +102,12 @@ python3 metrics.py
 Para reproduzir a avaliação completa do baseline ingênuo nas sequências do MOT17 (Parte 1):
 ```bash
 python3 -c "from src.tracker import NaiveTracker; from src.evaluation import run_mot17_baseline; run_mot17_baseline('data/MOT17/train', NaiveTracker())"
+```
+
+### 3. Teste de Estresse (Parte 5 — Degradação da Qualidade do Detector)
+Para reproduzir o teste de estresse em 4 intensidades (Controle, Leve, Moderada e Severa) confrontando o Baseline Ingênuo e o Modelo Temporal Recorrente (LSTM):
+```bash
+python3 -m src.stress
 ```
 
 ---

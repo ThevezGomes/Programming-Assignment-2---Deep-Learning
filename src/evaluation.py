@@ -18,7 +18,7 @@ from src.data import (
     load_mot17_sequence,
     compute_sequence_density,
 )
-from src.tracker import NaiveTracker
+from src.tracker import NaiveTracker, RNNMotionTracker
 from src.metrics import evaluate_tracking, compute_map_per_frame
 from src.inference import get_torchvision_person_detector, infer_torchvision_frame
 

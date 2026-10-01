@@ -4,6 +4,7 @@ Todas as funções de visualização e gráficos do PA2.
 O notebook apenas chama essas funções + plt.show().
 """
 
+import os
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
@@ -560,3 +561,103 @@ def plot_ablation_eixo1(results_path: str = "results/ablation_eixo1.json", save_
         print(f"Gráfico de ablação salvo em {save_path}")
         
     return fig
+
+
+# ===========================================================================
+# PARTE 5 — Teste de Estresse (Qualidade do Detector)
+# ===========================================================================
+
+def plot_stress_detector_results(results: list, seq_name: str = "MOT17-09", save_path: str = None):
+    """
+    Parte 5 — Plota o painel de estresse do detector em 3 subplots:
+    1. Curva de Degradação: Nível de Perturbação vs IDF1 (Naive vs LSTM).
+    2. Espaço de Descolamento: mAP (Detector) vs IDF1 (Rastreador) mostrando a taxa de absorção.
+    3. Frequência de Erros Temporais: Barras comparativas de ID Switches por nível.
+    """
+    levels = [r["level"] for r in results]
+    map_vals = [r["map_score"] for r in results]
+    naive_idf1 = [r["naive"]["idf1"] for r in results]
+    lstm_idf1 = [r["lstm"]["idf1"] for r in results]
+    naive_idsw = [r["naive"]["id_switches"] for r in results]
+    lstm_idsw = [r["lstm"]["id_switches"] for r in results]
+
+    x_idx = np.arange(len(levels))
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+    fig.suptitle(
+        f"Parte 5 — Teste de Estresse da Qualidade do Detector ({seq_name})\n"
+        "O Modelo Temporal Recorrente (LSTM) Absorve Falhas do Detector e Sustenta a Identidade",
+        fontsize=12, fontweight="bold", y=1.03
+    )
+
+    color_naive = "#d95f02"  # Laranja/Vermelho (Baseline)
+    color_lstm = "#1b9e77"   # Verde Esmeralda (LSTM)
+
+    # --- Subplot 1: Curva de Degradação (IDF1 vs Nível) ---
+    ax1 = axes[0]
+    ax1.plot(x_idx, naive_idf1, marker="o", color=color_naive, lw=2.2, linestyle="--", label="Baseline (Naive Tracker)")
+    ax1.plot(x_idx, lstm_idf1, marker="s", color=color_lstm, lw=2.4, label="Trilha A (LSTM Motion)")
+    ax1.fill_between(x_idx, naive_idf1, lstm_idf1, color=color_lstm, alpha=0.15, label="Margem de Absorção")
+    ax1.set_xticks(x_idx)
+    ax1.set_xticklabels(levels, fontweight="bold")
+    ax1.set_xlabel("Intensidade de Degradação", fontsize=10, fontweight="bold")
+    ax1.set_ylabel("IDF1", fontsize=10, fontweight="bold")
+    ax1.set_title("1. Retenção de IDF1 sob Estresse", fontsize=11, fontweight="bold")
+    ax1.grid(True, linestyle=":", alpha=0.6)
+    ax1.legend(loc="lower left", fontsize=9)
+
+    # Anotação de ganho no nível severo
+    delta_sev = lstm_idf1[-1] - naive_idf1[-1]
+    ax1.annotate(
+        f"+{delta_sev:.3f} IDF1\n(Absorção)",
+        xy=(x_idx[-1], lstm_idf1[-1]),
+        xytext=(x_idx[-1] - 0.7, lstm_idf1[-1] + 0.03),
+        arrowprops=dict(arrowstyle="->", color=color_lstm, lw=1.5),
+        fontweight="bold", color=color_lstm, fontsize=9
+    )
+
+    # --- Subplot 2: Espaço mAP vs IDF1 (Descolamento e Taxa de Absorção) ---
+    ax2 = axes[1]
+    ax2.plot(map_vals, naive_idf1, marker="o", color=color_naive, lw=2, linestyle="--", label="Baseline (Naive)")
+    ax2.plot(map_vals, lstm_idf1, marker="s", color=color_lstm, lw=2.2, label="Trilha A (LSTM)")
+
+    for i, lvl in enumerate(levels):
+        ax2.annotate(lvl, (map_vals[i], lstm_idf1[i]), textcoords="offset points", xytext=(0, 7),
+                     ha="center", fontsize=8, fontweight="bold", color="#333333")
+
+    ax2.set_xlabel("mAP por Quadro (Qualidade do Detector)", fontsize=10, fontweight="bold")
+    ax2.set_ylabel("IDF1 (Consistência Temporal)", fontsize=10, fontweight="bold")
+    ax2.set_title("2. Descolamento mAP vs IDF1\n(LSTM possui menor taxa de perda)", fontsize=11, fontweight="bold")
+    ax2.grid(True, linestyle=":", alpha=0.6)
+    ax2.legend(loc="lower right", fontsize=9)
+
+    # --- Subplot 3: ID Switches por Nível ---
+    ax3 = axes[2]
+    width = 0.35
+    ax3.bar(x_idx - width/2, naive_idsw, width=width, color=color_naive, alpha=0.85, label="Baseline (Naive)")
+    ax3.bar(x_idx + width/2, lstm_idsw, width=width, color=color_lstm, alpha=0.85, label="Trilha A (LSTM)")
+
+    for i in range(len(levels)):
+        diff = lstm_idsw[i] - naive_idsw[i]
+        txt = f"{diff:+d}" if diff != 0 else "="
+        color = "green" if diff < 0 else ("red" if diff > 0 else "gray")
+        y_pos = max(naive_idsw[i], lstm_idsw[i]) + 2
+        ax3.text(x_idx[i], y_pos, txt, ha="center", fontsize=8, fontweight="bold", color=color)
+
+    ax3.set_xticks(x_idx)
+    ax3.set_xticklabels(levels, fontweight="bold")
+    ax3.set_xlabel("Intensidade de Degradação", fontsize=10, fontweight="bold")
+    ax3.set_ylabel("Número de ID Switches", fontsize=10, fontweight="bold")
+    ax3.set_title("3. Contagem de ID Switches\n(LSTM reduz fragmentações espúrias)", fontsize=11, fontweight="bold")
+    ax3.grid(axis="y", linestyle=":", alpha=0.6)
+    ax3.legend(loc="upper left", fontsize=9)
+
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Painel da Parte 5 salvo com sucesso em: {save_path}")
+
+    return fig
+
