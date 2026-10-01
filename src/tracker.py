@@ -9,9 +9,11 @@ Rastreador de Linha de Base (Baseline por Quadro - Parte 1):
   * Morte: Track é extinta após k quadros consecutivos sem observação
 """
 
+import torch
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from src.metrics import box_iou_matrix, calculate_iou
+from src.models import MotionPredictor
 
 
 class Track:
@@ -144,3 +146,234 @@ class NaiveTracker:
             pred_by_frame[f] = active_tracks
 
         return pred_by_frame
+
+
+# ==============================================================================
+# PARTE 2 — TRILHA A: MODELO DE MOVIMENTO RECORRENTE (RNN / LSTM / GRU)
+# ==============================================================================
+
+class RNNTrack:
+    """
+    Representa o estado de uma trajetória governada por uma Rede Recorrente (Trilha A).
+    Mantém o estado oculto da RNN, caixa predita e incerteza associada.
+    """
+    def __init__(self, track_id: int, initial_box: np.ndarray, frame_id: int,
+                 model, im_w: float = 1920.0, im_h: float = 1080.0, device="cpu"):
+        self.track_id = track_id
+        self.last_box = np.asarray(initial_box, dtype=np.float32)
+        self.predicted_box = self.last_box.copy()
+        self.predicted_sigma = np.zeros(4, dtype=np.float32)
+        self.history = {frame_id: self.last_box}
+        self.prev_box = self.last_box.copy()
+        self.time_since_update = 0
+        self.state = "active"
+        self.age = 1
+
+        self.im_w = float(im_w)
+        self.im_h = float(im_h)
+        self.device = torch.device(device)
+
+        # Inicializa estado oculto
+        self.hidden = model.init_hidden(1, self.device)
+        self._predict_next(model, dt=1.0)
+
+    def _box_to_normalized_feat(self, box, prev_box, dt=1.0):
+        """Converte caixa [x, y, w, h] para vetor normalizado [cx, cy, w, h, vx, vy, dt]."""
+        cx = (box[0] + box[2] / 2.0) / self.im_w
+        cy = (box[1] + box[3] / 2.0) / self.im_h
+        w = box[2] / self.im_w
+        h = box[3] / self.im_h
+
+        prev_cx = (prev_box[0] + prev_box[2] / 2.0) / self.im_w
+        prev_cy = (prev_box[1] + prev_box[3] / 2.0) / self.im_h
+        vx = cx - prev_cx
+        vy = cy - prev_cy
+
+        feat = np.array([cx, cy, w, h, vx, vy, dt], dtype=np.float32)
+        box_norm = np.array([cx, cy, w, h], dtype=np.float32)
+        return feat, box_norm
+
+    def _unnormalize_box(self, box_norm):
+        """Converte de [cx, cy, w, h] normalizado para [x, y, w, h] em pixels."""
+        cx = float(box_norm[0]) * self.im_w
+        cy = float(box_norm[1]) * self.im_h
+        w = float(box_norm[2]) * self.im_w
+        h = float(box_norm[3]) * self.im_h
+        x = cx - w / 2.0
+        y = cy - h / 2.0
+        return np.array([x, y, w, h], dtype=np.float32)
+
+    def _predict_next(self, model, dt=1.0):
+        """Executa um passo da RNN para prever a caixa do próximo quadro."""
+        feat, box_norm = self._box_to_normalized_feat(self.last_box, self.prev_box, dt=dt)
+        x_t = torch.tensor(feat, dtype=torch.float32, device=self.device).unsqueeze(0)
+        curr_box = torch.tensor(box_norm, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        with torch.no_grad():
+            pred_box_norm, log_sigma, self.hidden = model.step(x_t, curr_box, self.hidden)
+
+        pred_box_np = pred_box_norm.squeeze(0).cpu().numpy()
+        self.predicted_box = self._unnormalize_box(pred_box_np)
+
+        if log_sigma is not None:
+            self.predicted_sigma = torch.exp(log_sigma).squeeze(0).cpu().numpy()
+
+    def update(self, box: np.ndarray, frame_id: int, model, dt=1.0):
+        """Atualiza a trajetória com nova observação e prevê o próximo passo."""
+        self.prev_box = self.last_box.copy()
+        self.last_box = np.asarray(box, dtype=np.float32)
+        self.history[frame_id] = self.last_box
+        self.time_since_update = 0
+        self.state = "active"
+        self.age += 1
+        self._predict_next(model, dt=dt)
+
+    def mark_missed(self, model, dt=1.0):
+        """
+        Sob oclusão: roda a RNN para frente em modo autoregressivo (free-running),
+        mantendo a estimativa de movimento no espaço.
+        """
+        self.time_since_update += 1
+        self.state = "lost"
+        self.age += 1
+
+        # Alimenta a própria previsão anterior na recorrência
+        self.prev_box = self.last_box.copy()
+        self.last_box = self.predicted_box.copy()
+        self._predict_next(model, dt=dt)
+
+
+class RNNMotionTracker:
+    """
+    Rastreador com Memória Temporal Recorrente (Trilha A):
+    - Associação via IoU entre caixa PREVISTA pelo modelo recorrente e detecções observadas
+    - Portão adaptativo baseado na incerteza gaussiana sigma
+    - Sob oclusão: rollout autoregressivo mantendo velocidade e momento
+    """
+    def __init__(
+        self,
+        model: str or MotionPredictor,
+        iou_threshold: float = 0.3,
+        max_lost_frames: int = 15,
+        matching_method: str = "hungarian",
+        use_adaptive_gating: bool = True,
+        device: str = "cuda"
+    ):
+        if device == "cuda" and not torch.cuda.is_available():
+            device = "cpu"
+        self.device = torch.device(device)
+
+        if isinstance(model, str):
+            # Carrega de checkpoint
+            ckpt = torch.load(model, map_location=self.device)
+            cell_type = ckpt.get("cell_type", "lstm")
+            hidden_dim = ckpt.get("hidden_dim", 128)
+            num_layers = ckpt.get("num_layers", 2)
+            self.model = MotionPredictor(cell_type=cell_type, hidden_dim=hidden_dim, num_layers=num_layers)
+            self.model.load_state_dict(ckpt["model_state_dict"])
+        else:
+            self.model = model
+
+        self.model.to(self.device)
+        self.model.eval()
+
+        self.iou_threshold = iou_threshold
+        self.max_lost_frames = max_lost_frames
+        self.matching_method = matching_method
+        self.use_adaptive_gating = use_adaptive_gating
+
+        self.next_id = 1
+        self.tracks = []
+
+    def reset(self):
+        self.next_id = 1
+        self.tracks = []
+
+    def step(self, detections: list or dict, frame_id: int, im_width: float = 1920.0,
+             im_height: float = 1080.0, dt: float = 1.0):
+        """Processa um quadro com predição recorrente."""
+        if isinstance(detections, dict):
+            detections = list(detections.values())
+
+        det_boxes = []
+        for d in detections:
+            det_boxes.append(d[:4])
+        det_boxes = np.array(det_boxes, dtype=np.float32) if len(det_boxes) > 0 else np.empty((0, 4))
+
+        candidate_tracks = [t for t in self.tracks if t.state in ["active", "lost"]]
+        matched_tracks = set()
+        matched_dets = set()
+
+        if len(candidate_tracks) > 0 and len(det_boxes) > 0:
+            # Ponto-chave da Trilha A: compara as caixas PREVISTAS pela RNN (e não as congeladas!)
+            pred_boxes = np.array([t.predicted_box for t in candidate_tracks], dtype=np.float32)
+            ious = box_iou_matrix(pred_boxes, det_boxes)
+
+            if self.matching_method == "hungarian":
+                row_ind, col_ind = linear_sum_assignment(-ious)
+                for r, c in zip(row_ind, col_ind):
+                    track = candidate_tracks[r]
+                    # Portão adaptativo: relaxa o limiar de IoU se a incerteza prevista for maior
+                    thresh = self.iou_threshold
+                    if self.use_adaptive_gating:
+                        uncertainty = np.mean(track.predicted_sigma)
+                        thresh = max(0.15, self.iou_threshold - 0.1 * min(1.0, uncertainty))
+
+                    if ious[r, c] >= thresh:
+                        track.update(det_boxes[c], frame_id, self.model, dt=dt)
+                        matched_tracks.add(r)
+                        matched_dets.add(c)
+            else:
+                flat_order = np.argsort(-ious, axis=None)
+                for idx in flat_order:
+                    r, c = np.unravel_index(idx, ious.shape)
+                    track = candidate_tracks[r]
+                    thresh = self.iou_threshold
+                    if self.use_adaptive_gating:
+                        thresh = max(0.15, self.iou_threshold - 0.1 * min(1.0, np.mean(track.predicted_sigma)))
+                    if ious[r, c] < thresh:
+                        break
+                    if r not in matched_tracks and c not in matched_dets:
+                        track.update(det_boxes[c], frame_id, self.model, dt=dt)
+                        matched_tracks.add(r)
+                        matched_dets.add(c)
+
+        # 1. Tracks não associadas (sob oclusão): rodam a RNN autoregressivamente
+        for i, track in enumerate(candidate_tracks):
+            if i not in matched_tracks:
+                track.mark_missed(self.model, dt=dt)
+                if track.time_since_update > self.max_lost_frames:
+                    track.state = "dead"
+
+        # 2. Novas detecções iniciam tracks
+        for j in range(len(det_boxes)):
+            if j not in matched_dets:
+                new_track = RNNTrack(
+                    self.next_id, det_boxes[j], frame_id, self.model,
+                    im_w=im_width, im_h=im_height, device=self.device
+                )
+                self.next_id += 1
+                self.tracks.append(new_track)
+
+        # Retorna apenas tracks com observação no quadro atual
+        current_active = {}
+        for t in self.tracks:
+            if t.time_since_update == 0:
+                current_active[t.track_id] = t.last_box
+
+        return current_active
+
+    def track_sequence(self, det_by_frame: dict, im_width: float = 1920.0,
+                       im_height: float = 1080.0, dt: float = 1.0):
+        """Rastreia uma sequência completa utilizando predição recorrente."""
+        self.reset()
+        all_frames = sorted(list(det_by_frame.keys()))
+        pred_by_frame = {}
+
+        for f in all_frames:
+            dets = det_by_frame[f]
+            active_tracks = self.step(dets, f, im_width=im_width, im_height=im_height, dt=dt)
+            pred_by_frame[f] = active_tracks
+
+        return pred_by_frame
+

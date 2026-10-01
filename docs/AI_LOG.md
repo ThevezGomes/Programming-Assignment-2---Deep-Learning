@@ -29,3 +29,9 @@
 * **Uso da IA:** A IA implementou o gerador de oclusão controlada no $z$-buffer com renderização da tira cronológica (`docs/parte0_trajetoria_oclusao.png`), o ensaio multi-botão (`docs/parte0_curva_quebra_gerador.png`), a execução da Fonte 2 (Faster R-CNN COCO com `custom_nms`) em dados reais do MOT17 (`docs/parte1_comparacao_fontes_real.png`) e o painel obrigatório do descolamento com dois subplots verticais (`docs/painel_descolamento_parte1.png`).
 * **Resultado:** Partes 0 e 1 100% aderentes a todos os critérios e figuras do enunciado oficial.
 
+### Episódio 4: Implementação da Parte 2 (Trilha A: Modelo de Movimento com Incerteza)
+* **Contexto:** Escolha e estruturação da Trilha A com rede recorrente para predição de caixas delimitadoras sob oclusão, integrando com as perguntas de ablação (Parte 3), gradientes analíticos (Parte 4) e estresse temporal (Parte 5).
+* **Uso da IA:** A IA projetou o `MotionPredictor` modular em PyTorch suportando células LSTM, GRU e RNN Simples, com predição residual de caixas e cabeça de incerteza gaussiana (otimizada via Gaussian NLL + Smooth L1). Implementou o `RNNMotionTracker` com rollout autoregressivo sob oclusão e portão adaptativo, o pipeline de treinamento com Scheduled Sampling e a comparação lado a lado contra o baseline ingênuo (`docs/parte2_comparacao_baseline_trilhaA.png`).
+* **Resultado:** Parte 2 concluída com checkpoint treinado e convergência comprovada, deixando a base pronta para as ablações da Parte 3.
+
+

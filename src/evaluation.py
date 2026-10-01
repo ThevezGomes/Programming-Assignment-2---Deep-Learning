@@ -540,3 +540,73 @@ def compare_real_detection_sources(
         "sample_images": sample_images
     }
 
+
+def run_part2_comparison(
+    data_dir: str,
+    tracker_naive: NaiveTracker,
+    tracker_rnn: RNNMotionTracker,
+    seq_names: list = None,
+    det_suffix: str = "SDP"
+) -> list:
+    """
+    Parte 2 — Comparação Lado a Lado: Baseline Ingênuo (Parte 1) vs Trilha A (Modelo de Movimento LSTM).
+    Avalia nas sequências de validação (ou selecionadas) com as mesmas detecções congeladas.
+    """
+    if seq_names is None:
+        seq_names = ["09", "11", "05"]
+
+    SEP = "=" * 90
+    print(SEP)
+    print("PARTE 2 (TRILHA A): COMPARAÇÃO LADO A LADO — BASELINE INGÊNUO vs RNN MOTION MODEL")
+    print(SEP)
+    print("{:<10} | {:<18} | {:<8} | {:<8} | {:<8} | {}".format(
+        "Sequência", "Modelo", "IDF1", "IDSW", "Frag", "Razão IDs"
+    ))
+    print("-" * 90)
+
+    comparison_results = []
+
+    for s_name in seq_names:
+        seq_p = os.path.join(data_dir, f"MOT17-{s_name}-{det_suffix}")
+        if not os.path.exists(seq_p):
+            continue
+
+        gt, dets, info = load_mot17_sequence(seq_p)
+        w = float(info.get("imWidth", 1920))
+        h = float(info.get("imHeight", 1080))
+        density = compute_sequence_density(gt)
+
+        # 1. Baseline Naive
+        tracker_naive.reset()
+        preds_n = tracker_naive.track_sequence(dets)
+        mn = evaluate_tracking(gt, preds_n)
+
+        # 2. Trilha A (RNN Motion)
+        tracker_rnn.reset()
+        preds_r = tracker_rnn.track_sequence(dets, im_width=w, im_height=h)
+        mr = evaluate_tracking(gt, preds_r)
+
+        delta_idf1 = mr["idf1"] - mn["idf1"]
+        delta_sw = mr["id_switches"] - mn["id_switches"]
+
+        print("{:<10} | {:<18} | {:<8.3f} | {:<8d} | {:<8d} | {:.2f}x".format(
+            f"MOT17-{s_name}", "Baseline (Naive)", mn["idf1"], mn["id_switches"], mn["fragmentations"], mn["ratio_ids"]
+        ))
+        print("{:<10} | {:<18} | {:<8.3f} | {:<8d} | {:<8d} | {:.2f}x (Delta IDF1: {:+.3f}, Delta IDSW: {:+d})".format(
+            "", "Trilha A (LSTM)", mr["idf1"], mr["id_switches"], mr["fragmentations"], mr["ratio_ids"], delta_idf1, delta_sw
+        ))
+        print("-" * 90)
+
+        comparison_results.append({
+            "seq_name": f"MOT17-{s_name}",
+            "density": density,
+            "naive": mn,
+            "rnn": mr,
+            "delta_idf1": delta_idf1,
+            "delta_switches": delta_sw
+        })
+
+    print(SEP + "\n")
+    return comparison_results
+
+

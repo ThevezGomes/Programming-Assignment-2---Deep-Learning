@@ -417,11 +417,81 @@ def plot_real_source_comparison(
     )
     plt.tight_layout()
 
+    return fig
+
+
+def plot_part2_comparison_panel(
+    comparison_results: list,
+    training_history: dict = None,
+    save_path: str = None
+):
+    """
+    Parte 2 — Painel Visual Comparativo:
+    - Subplot 1: Comparação de IDF1 (Baseline vs Trilha A LSTM)
+    - Subplot 2: Comparação de ID Switches (Redução drástica de trocas)
+    - Subplot 3: Curva de Treinamento da LSTM (Smooth L1 Loss na validação)
+    """
+    seqs = [r["seq_name"] for r in comparison_results]
+    idf_naive = [r["naive"]["idf1"] for r in comparison_results]
+    idf_rnn   = [r["rnn"]["idf1"] for r in comparison_results]
+    sw_naive  = [r["naive"]["id_switches"] for r in comparison_results]
+    sw_rnn    = [r["rnn"]["id_switches"] for r in comparison_results]
+
+    x = np.arange(len(seqs))
+    w = 0.35
+
+    n_cols = 3 if training_history is not None else 2
+    fig, axes = plt.subplots(1, n_cols, figsize=(5.5 * n_cols, 4.5))
+
+    # 1. IDF1
+    axes[0].bar(x - w/2, idf_naive, w, label="Baseline (Naive)", color="#7570b3", alpha=0.9)
+    axes[0].bar(x + w/2, idf_rnn,   w, label="Trilha A (LSTM)",   color="#1b9e77", alpha=0.9)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(seqs, fontsize=10, fontweight="bold")
+    axes[0].set_ylabel("IDF1", fontsize=11, fontweight="bold")
+    axes[0].set_ylim(0, 1.05)
+    axes[0].set_title("1. Consistência Temporal (IDF1)", fontsize=11, fontweight="bold")
+    axes[0].legend(loc="lower right")
+    axes[0].grid(axis="y", linestyle="--", alpha=0.4)
+    for i in range(len(x)):
+        axes[0].text(x[i] - w/2, idf_naive[i] + 0.02, f"{idf_naive[i]:.2f}", ha="center", fontsize=8)
+        axes[0].text(x[i] + w/2, idf_rnn[i] + 0.02, f"{idf_rnn[i]:.2f}", ha="center", fontsize=8, color="#0b6647", fontweight="bold")
+
+    # 2. ID Switches
+    axes[1].bar(x - w/2, sw_naive, w, label="Baseline (Naive)", color="#d95f02", alpha=0.9)
+    axes[1].bar(x + w/2, sw_rnn,   w, label="Trilha A (LSTM)",   color="#2b5c8f", alpha=0.9)
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(seqs, fontsize=10, fontweight="bold")
+    axes[1].set_ylabel("Total de ID Switches", fontsize=11, fontweight="bold")
+    axes[1].set_title("2. Trocas de Identidade (ID Switches)", fontsize=11, fontweight="bold")
+    axes[1].legend(loc="upper right")
+    axes[1].grid(axis="y", linestyle="--", alpha=0.4)
+    for i in range(len(x)):
+        axes[1].text(x[i] - w/2, sw_naive[i] + 1, f"{sw_naive[i]}", ha="center", fontsize=8)
+        axes[1].text(x[i] + w/2, sw_rnn[i] + 1, f"{sw_rnn[i]}", ha="center", fontsize=8, color="#1c3d61", fontweight="bold")
+
+    # 3. Curva de Treinamento (se fornecido)
+    if training_history is not None:
+        epochs = np.arange(1, len(training_history["val_smooth_l1"]) + 1)
+        axes[2].plot(epochs, training_history["val_smooth_l1"], "o-", color="#1b9e77", lw=2, label="Val Smooth-L1")
+        axes[2].set_xlabel("Época", fontsize=10)
+        axes[2].set_ylabel("Erro de Posição da Caixa (Smooth L1)", fontsize=10)
+        axes[2].set_title("3. Convergência da LSTM de Movimento", fontsize=11, fontweight="bold")
+        axes[2].grid(True, linestyle="--", alpha=0.4)
+        axes[2].legend()
+
+    plt.suptitle(
+        "Parte 2 (Trilha A) — Comparação Direta: Baseline Ingênuo vs Memória Temporal Recorrente",
+        fontsize=13, fontweight="bold", y=1.03
+    )
+    plt.tight_layout()
+
     if save_path:
         import os
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=200, bbox_inches="tight")
-        print(f"Comparação de fontes reais salva em {save_path}")
+        print(f"Painel da Parte 2 salvo em {save_path}")
 
     return fig
+
 

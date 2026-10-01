@@ -87,10 +87,10 @@ O rastreador de linha de base (`NaiveTracker` em `src/tracker.py`) opera sem mem
 
 ## Comandos de Treinamento e Avaliação
 
-### 1. Treinamento
-Para rodar o treinamento do modelo temporal e as ablações com 3 seeds:
+### 1. Treinamento (Trilha A — Modelo Temporal de Movimento)
+Para treinar a rede recorrente (LSTM) nas trajetórias de pedestres do MOT17 e salvar o checkpoint:
 ```bash
-python3 -c "import src.training as t; print('Comando de treino')"
+python3 -m src.training
 ```
 
 ### 2. Avaliação
