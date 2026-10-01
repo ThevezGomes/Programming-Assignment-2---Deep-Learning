@@ -19,6 +19,7 @@ Thumbs.db
 
 # Large Data & Checkpoints
 data/MOT17/
+data/MOT17Labels/
 data/synthetic/
 checkpoints/*.pt
 !checkpoints/.gitkeep

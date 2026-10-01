@@ -67,7 +67,10 @@ class NaiveTracker:
         frame_id: índice temporal do quadro
         Retorna: dict {track_id: box} das tracks ativas no quadro
         """
-        # Extrai coordenadas [x, y, w, h]
+        # Extrai coordenadas [x, y, w, h] (suporta tanto list de caixas quanto dict {id: box})
+        if isinstance(detections, dict):
+            detections = list(detections.values())
+
         det_boxes = []
         for d in detections:
             det_boxes.append(d[:4])

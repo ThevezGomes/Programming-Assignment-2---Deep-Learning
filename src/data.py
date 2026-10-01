@@ -46,13 +46,13 @@ def generate_synthetic_video(
     rng = np.random.default_rng(seed)
 
     # --- Inicializa os objetos ---
-    semi_a = rng.integers(6, 14, size=num_objects).astype(float)   # semi-eixo horizontal
-    semi_b = rng.integers(6, 14, size=num_objects).astype(float)   # semi-eixo vertical
-    cx = rng.uniform(semi_a + 2, frame_size - semi_a - 2)           # centro X
-    cy = rng.uniform(semi_b + 2, frame_size - semi_b - 2)           # centro Y
+    semi_a = rng.integers(7, 13, size=num_objects).astype(float)   # semi-eixo horizontal
+    semi_b = rng.integers(7, 13, size=num_objects).astype(float)   # semi-eixo vertical
+    cx = rng.uniform(semi_a + 4, frame_size - semi_a - 4)           # centro X
+    cy = rng.uniform(semi_b + 4, frame_size - semi_b - 4)           # centro Y
     angle = rng.uniform(0, 2 * np.pi, size=num_objects)             # ângulo de rotação (estético)
 
-    # Velocidades (pixels/frame), com mudança de direção suave nas bordas
+    # Velocidades (pixels/frame)
     vx = rng.uniform(-typical_velocity, typical_velocity, size=num_objects)
     vy = rng.uniform(-typical_velocity, typical_velocity, size=num_objects)
     # Garante que nenhum inicie com velocidade zero
@@ -62,11 +62,34 @@ def generate_synthetic_video(
     # Z-order fixo para toda a sequência: índice menor = mais fundo (atrás)
     z_order = np.arange(num_objects)  # objeto 0 fica atrás de todos os outros
 
+    # Se occlusion_duration for especificado e houver pelo menos 2 objetos,
+    # programa o objeto 0 (fundo) para cruzar diretamente atrás do objeto 1 (frente)
+    if occlusion_duration > 0 and num_objects >= 2:
+        # Aumenta o oclusor (objeto 1) para garantir cobertura completa
+        semi_a[1] = max(semi_a[1], semi_a[0] + 6.0)
+        semi_b[1] = max(semi_b[1], semi_b[0] + 6.0)
+        # Oclusor no centro
+        cx[1] = frame_size / 2.0
+        cy[1] = frame_size / 2.0
+        vx[1] = 0.0
+        vy[1] = 0.0
+
+        # Alvo (objeto 0) atravessa na horizontal na mesma altura
+        cy[0] = cy[1]
+        vy[0] = 0.0
+        # Velocidade calculada para ficar ocluído por aproximadamente occlusion_duration quadros
+        eff_occ_dur = max(2, min(occlusion_duration, num_frames // 2))
+        occ_vx = (2.0 * (semi_a[1] - semi_a[0])) / float(eff_occ_dur)
+        occ_vx = max(0.8, min(occ_vx, float(typical_velocity * 1.5)))
+        vx[0] = occ_vx
+        # Posiciona para cruzar o centro no meio do vídeo
+        mid_f = num_frames // 2
+        cx[0] = cx[1] - vx[0] * mid_f
+
     # Cores distintas por objeto (HSV espaçado uniformemente -> RGB)
     colors = []
     for i in range(num_objects):
         hue = i / num_objects
-        # Conversão HSV simplificada
         h = hue * 6
         x_c = 1 - abs(h % 2 - 1)
         r, g, b = [(1, x_c, 0), (x_c, 1, 0), (0, 1, x_c),
@@ -76,20 +99,21 @@ def generate_synthetic_video(
     frames = []
     gt_by_frame = {}
 
-    # Pré-calcular grid de coordenadas do frame
     yy, xx = np.mgrid[0:frame_size, 0:frame_size]
 
     for f in range(num_frames):
-        frame = np.full((frame_size, frame_size, 3), 30, dtype=np.uint8)  # Fundo escuro
+        # Fundo escuro com leve textura/ruído
+        frame = np.full((frame_size, frame_size, 3), 30, dtype=np.uint8)
+        if noise_level > 0:
+            bg_noise = rng.normal(0, noise_level * 50, (frame_size, frame_size, 3))
+            frame = np.clip(frame.astype(float) + bg_noise, 0, 255).astype(np.uint8)
 
-        # Mapa de z-buffer: qual objeto está visível em cada pixel
         z_buffer = -np.ones((frame_size, frame_size), dtype=int)
 
         # Desenha os objetos em ordem de z (do mais fundo para o mais próximo)
         for z in range(num_objects):
             obj_idx = np.argsort(z_order)[z]
 
-            # Equação da elipse girada
             cos_a = np.cos(angle[obj_idx])
             sin_a = np.sin(angle[obj_idx])
             dx = xx - cx[obj_idx]
@@ -97,29 +121,24 @@ def generate_synthetic_video(
             x_rot = dx * cos_a + dy * sin_a
             y_rot = -dx * sin_a + dy * cos_a
 
-            # Máscara da elipse
             mask = ((x_rot / semi_a[obj_idx]) ** 2 + (y_rot / semi_b[obj_idx]) ** 2) <= 1.0
 
-            # Desenha no frame com z-buffer (objeto mais próximo sobrescreve)
             frame[mask] = colors[obj_idx]
             z_buffer[mask] = obj_idx
 
         frames.append(frame)
 
-        # Ground Truth: bounding box axial de cada objeto
-        # Apenas registra objetos que têm pelo menos 1 pixel visível (não totalmente ocluídos)
+        # Ground Truth: apenas se tiver visibilidade real no z-buffer
         gt_by_frame[f + 1] = {}
         for obj_idx in range(num_objects):
-            # Pixels do objeto que são realmente visíveis (top no z-buffer)
             visible = (z_buffer == obj_idx)
-            visible_frac = visible.sum() / np.pi / semi_a[obj_idx] / semi_b[obj_idx]
+            area_elipse = np.pi * semi_a[obj_idx] * semi_b[obj_idx]
+            visible_frac = visible.sum() / max(1.0, area_elipse)
 
-            # Inclui no GT mesmo que parcialmente ocluído (visibility >= 0.2)
-            if visible_frac >= 0.1:
-                # Bounding box da ELIPSE COMPLETA (não só parte visível — padrão MOT)
+            # Requisito de oclusão real: se ocluído quase totalmente (< 5% visível), desaparece do GT
+            if visible_frac >= 0.08:
                 cos_a = np.cos(angle[obj_idx])
                 sin_a = np.sin(angle[obj_idx])
-                # Bounding box da elipse girada (fórmula analítica)
                 hw = np.sqrt((semi_a[obj_idx] * cos_a) ** 2 + (semi_b[obj_idx] * sin_a) ** 2)
                 hh = np.sqrt((semi_a[obj_idx] * sin_a) ** 2 + (semi_b[obj_idx] * cos_a) ** 2)
                 x_box = float(np.clip(cx[obj_idx] - hw, 0, frame_size))
@@ -132,8 +151,10 @@ def generate_synthetic_video(
         cx += vx
         cy += vy
 
-        # Reflexão suave nas bordas
+        # Reflexão suave nas bordas (exceto objeto 1 se for oclusor fixo programado)
         for i in range(num_objects):
+            if occlusion_duration > 0 and i == 1:
+                continue
             if cx[i] - semi_a[i] < 0:
                 cx[i] = semi_a[i]
                 vx[i] = abs(vx[i])
@@ -147,14 +168,116 @@ def generate_synthetic_video(
                 cy[i] = frame_size - semi_b[i]
                 vy[i] = -abs(vy[i])
 
-        # Perturbação leve de velocidade (movimento mais orgânico)
-        vx += rng.uniform(-0.2, 0.2, size=num_objects)
-        vy += rng.uniform(-0.2, 0.2, size=num_objects)
-        vx = np.clip(vx, -typical_velocity * 1.5, typical_velocity * 1.5)
-        vy = np.clip(vy, -typical_velocity * 1.5, typical_velocity * 1.5)
-
     frames = np.stack(frames, axis=0)
     return frames, gt_by_frame
+
+
+def generate_controlled_occlusion_sequence(
+    num_frames: int = 35,
+    occlusion_duration: int = 8,
+    frame_size: int = 128
+):
+    """
+    Gera um cenário determinístico para demonstrar o requisito verificável da Parte 0:
+    Uma elipse (Objeto 1, alvo verde no fundo z=0) passa diretamente atrás de uma
+    segunda elipse (Objeto 2, oclusor vermelho na frente z=1).
+
+    O Objeto 1 desaparece completamente (0 pixels visíveis no z-buffer) por exatamente
+    `occlusion_duration` quadros e reaparece em seguida com a mesma identidade.
+
+    Retorna
+    -------
+    frames: np.ndarray (num_frames, 128, 128, 3)
+    gt_by_frame: dict {frame: {id: [x, y, w, h]}}
+    occlusion_info: dict com start_frame, end_frame, num_occluded_frames
+    """
+    yy, xx = np.mgrid[0:frame_size, 0:frame_size]
+
+    # Objeto 1: Alvo (Verde esmeralda, menor, fundo z=0)
+    target_semi_a = 7.0
+    target_semi_b = 10.0
+    color_target = (0, 230, 115)  # Verde
+
+    # Objeto 2: Oclusor (Vermelho carmesim, maior, frente z=1)
+    occluder_semi_a = 18.0
+    occluder_semi_b = 22.0
+    occluder_cx = frame_size / 2.0
+    occluder_cy = frame_size / 2.0
+    color_occluder = (235, 55, 55)  # Vermelho
+
+    # Velocidade do alvo calculada para ficar completamente coberto por occlusion_duration quadros
+    # Distância em que o alvo fica 100% contido no interior do oclusor:
+    # (occluder_cx - occluder_semi_a + target_semi_a) até (occluder_cx + occluder_semi_a - target_semi_a)
+    hidden_span = 2.0 * (occluder_semi_a - target_semi_a)
+    target_vx = hidden_span / float(occlusion_duration)
+
+    mid_frame = num_frames // 2
+    # Define cx inicial do alvo para que o meio da oclusão ocorra no mid_frame
+    target_cx_init = occluder_cx - target_vx * mid_frame
+
+    frames = []
+    gt_by_frame = {}
+    occluded_frames = []
+
+    target_cx = target_cx_init
+    target_cy = occluder_cy
+
+    for f in range(1, num_frames + 1):
+        frame = np.full((frame_size, frame_size, 3), 32, dtype=np.uint8)
+        z_buffer = -np.ones((frame_size, frame_size), dtype=int)
+
+        # 1. Desenha Alvo (z=0, mais fundo)
+        dx_t = xx - target_cx
+        dy_t = yy - target_cy
+        mask_target = ((dx_t / target_semi_a) ** 2 + (dy_t / target_semi_b) ** 2) <= 1.0
+        frame[mask_target] = color_target
+        z_buffer[mask_target] = 0
+
+        # 2. Desenha Oclusor (z=1, frente, sobrescreve)
+        dx_o = xx - occluder_cx
+        dy_o = yy - occluder_cy
+        mask_occluder = ((dx_o / occluder_semi_a) ** 2 + (dy_o / occluder_semi_b) ** 2) <= 1.0
+        frame[mask_occluder] = color_occluder
+        z_buffer[mask_occluder] = 1
+
+        frames.append(frame)
+        gt_by_frame[f] = {}
+
+        # Oclusor sempre visível
+        gt_by_frame[f][2] = np.array([
+            occluder_cx - occluder_semi_a,
+            occluder_cy - occluder_semi_b,
+            2 * occluder_semi_a,
+            2 * occluder_semi_b
+        ], dtype=np.float32)
+
+        # Alvo: visível se tiver pelo menos 8% da área visível no z-buffer
+        target_vis_pixels = (z_buffer == 0).sum()
+        target_area = np.pi * target_semi_a * target_semi_b
+        target_vis_frac = target_vis_pixels / max(1.0, target_area)
+
+        if target_vis_frac >= 0.08:
+            gt_by_frame[f][1] = np.array([
+                target_cx - target_semi_a,
+                target_cy - target_semi_b,
+                2 * target_semi_a,
+                2 * target_semi_b
+            ], dtype=np.float32)
+        else:
+            occluded_frames.append(f)
+
+        target_cx += target_vx
+
+    frames = np.stack(frames, axis=0)
+    occlusion_info = {
+        "start_frame": min(occluded_frames) if occluded_frames else -1,
+        "end_frame": max(occluded_frames) if occluded_frames else -1,
+        "num_occluded_frames": len(occluded_frames),
+        "occluded_frames": occluded_frames
+    }
+
+    return frames, gt_by_frame, occlusion_info
+
 
 
 # ==============================================================================

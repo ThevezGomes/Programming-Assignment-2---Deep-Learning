@@ -13,6 +13,7 @@ from PIL import Image
 
 from src.data import (
     generate_synthetic_video,
+    generate_controlled_occlusion_sequence,
     degrade_detections,
     load_mot17_sequence,
     compute_sequence_density,
@@ -101,6 +102,101 @@ def run_synthetic_breakdown(
 
     print(SEP)
     return results
+
+
+def run_generator_knobs_breakdown(
+    tracker: NaiveTracker = None,
+    iou_threshold: float = 0.3,
+    max_lost_frames: int = 10,
+    seed: int = 42,
+) -> dict:
+    """
+    Parte 0 (Item 4) — Gira os botões do gerador para avaliar o baseline no piso fácil
+    e revelar onde a associação ingênua começa a quebrar:
+    - Botão 1: Velocidade típica (1.0, 2.5, 5.0, 8.0, 12.0 px/frame)
+    - Botão 2: Duração da oclusão (2, 5, 10, 16, 22 quadros) com max_lost_frames=10
+    - Botão 3: Densidade de objetos (3, 6, 9, 13, 18 objetos em 128x128)
+    """
+    if tracker is None:
+        tracker = NaiveTracker(iou_threshold=iou_threshold, max_lost_frames=max_lost_frames)
+
+    SEP = "=" * 78
+    print(SEP)
+    print("PARTE 0 (Item 4) — ENSAIO DA PARTE 1: GIRANDO OS BOTOES DO GERADOR")
+    print(SEP)
+
+    # 1. BOTAO: VELOCIDADE
+    print("\n--- 1. BOTAO: VELOCIDADE TYPICAL (num_objects=5, sem oclusao prolongada) ---")
+    print("{:<12} | {:<8} | {:<6} | {:<8} | {:<10} | {}".format(
+        "Vel (px/f)", "IDF1", "IDSW", "Frag", "Razao IDs", "Diagnostico"
+    ))
+    print("-" * 78)
+    vel_results = []
+    velocities = [1.0, 2.5, 5.0, 8.0, 12.0]
+    for v in velocities:
+        frames, gt = generate_synthetic_video(
+            num_frames=40, num_objects=5, frame_size=128, typical_velocity=v,
+            occlusion_duration=0, seed=seed
+        )
+        tracker.reset()
+        preds = tracker.track_sequence(gt)
+        m = evaluate_tracking(gt, preds, iou_threshold=iou_threshold)
+        note = "Piso facil (ok)" if v <= 2.5 else ("IoU falha (v > caixa)" if v >= 8.0 else "Instabilidade")
+        print("{:<12.1f} | {:<8.3f} | {:<6d} | {:<8d} | {:<9.2f}x | {}".format(
+            v, m["idf1"], m["id_switches"], m["fragmentations"], m["ratio_ids"], note
+        ))
+        vel_results.append({"velocity": v, **m})
+
+    # 2. BOTAO: DURACAO DA OCLUSAO
+    print(f"\n--- 2. BOTAO: DURACAO DA OCLUSAO (k_max_lost={max_lost_frames} quadros) ---")
+    print("{:<12} | {:<8} | {:<6} | {:<8} | {:<10} | {}".format(
+        "Oclusao (f)", "IDF1", "IDSW", "Frag", "Razao IDs", "Diagnostico"
+    ))
+    print("-" * 78)
+    occ_results = []
+    occlusions = [2, 5, 10, 16, 22]
+    for occ in occlusions:
+        frames, gt, info = generate_controlled_occlusion_sequence(
+            num_frames=45, occlusion_duration=occ, frame_size=128
+        )
+        tracker.reset()
+        preds = tracker.track_sequence(gt)
+        m = evaluate_tracking(gt, preds, iou_threshold=iou_threshold)
+        note = "Track sobrevive (occ <= k)" if occ <= max_lost_frames else "Track MORRE e troca ID (occ > k)!"
+        print("{:<12d} | {:<8.3f} | {:<6d} | {:<8d} | {:<9.2f}x | {}".format(
+            occ, m["idf1"], m["id_switches"], m["fragmentations"], m["ratio_ids"], note
+        ))
+        occ_results.append({"occlusion": occ, **m})
+
+    # 3. BOTAO: NUMERO DE OBJETOS / DENSIDADE
+    print("\n--- 3. BOTAO: NUMERO DE OBJETOS / DENSIDADE (vel=2.0 px/frame) ---")
+    print("{:<12} | {:<8} | {:<6} | {:<8} | {:<10} | {}".format(
+        "Objetos", "IDF1", "IDSW", "Frag", "Razao IDs", "Diagnostico"
+    ))
+    print("-" * 78)
+    obj_results = []
+    n_objs = [3, 6, 9, 13, 18]
+    for n in n_objs:
+        frames, gt = generate_synthetic_video(
+            num_frames=40, num_objects=n, frame_size=128, typical_velocity=2.0,
+            occlusion_duration=0, seed=seed
+        )
+        tracker.reset()
+        preds = tracker.track_sequence(gt)
+        m = evaluate_tracking(gt, preds, iou_threshold=iou_threshold)
+        note = "Cena limpa" if n <= 6 else ("Aglomeracao e trocas" if n >= 13 else "Cruzamentos")
+        print("{:<12d} | {:<8.3f} | {:<6d} | {:<8d} | {:<9.2f}x | {}".format(
+            n, m["idf1"], m["id_switches"], m["fragmentations"], m["ratio_ids"], note
+        ))
+        obj_results.append({"num_objects": n, **m})
+
+    print(SEP + "\n")
+    return {
+        "velocity": vel_results,
+        "occlusion": occ_results,
+        "density": obj_results
+    }
+
 
 
 # ===========================================================================
@@ -349,3 +445,98 @@ def compare_detection_sources(
         "n_fonte1": n1,
         "n_fonte2": n2,
     }
+
+
+def compare_real_detection_sources(
+    seq_path: str,
+    num_frames: int = 50,
+    device: str = "cuda",
+    min_score: float = 0.5,
+) -> dict:
+    """
+    Parte 1 (Item 1) — Avalia as duas fontes de detecção em quadros REAIS do MOT17:
+    - Fonte 1: Detecções públicas SDP (det/det.txt)
+    - Fonte 2: Detector Faster R-CNN ResNet-50 FPN pré-treinado no COCO com custom_nms.
+
+    Compara mAP, IDF1 e ID switches com NaiveTracker nos mesmos quadros.
+    """
+    import torch
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+
+    gt_full, sdp_full, seq_info = load_mot17_sequence(seq_path)
+    img_dir = os.path.join(seq_path, "img1")
+
+    # Limita aos primeiros num_frames
+    target_frames = list(range(1, num_frames + 1))
+    gt_sub = {f: gt_full.get(f, {}) for f in target_frames}
+    sdp_sub = {f: sdp_full.get(f, []) for f in target_frames}
+
+    print(f"Carregando Faster R-CNN ResNet-50 FPN no dispositivo {device}...")
+    model = get_torchvision_person_detector(device=device)
+
+    print(f"Executando inferência com custom_nms em {num_frames} quadros de {os.path.basename(seq_path)}...")
+    rcnn_dets = {}
+    sample_images = {}
+
+    for f in target_frames:
+        img_name = f"{f:06d}.jpg"
+        img_p = os.path.join(img_dir, img_name)
+        if not os.path.exists(img_p):
+            continue
+        pil_img = Image.open(img_p).convert("RGB")
+        dets = infer_torchvision_frame(model, pil_img, min_score=min_score, device=device)
+        rcnn_dets[f] = dets
+        if f in [1, 10, 25]:
+            sample_images[f] = pil_img
+
+    # Avaliação de mAP
+    map_sdp = compute_map_per_frame(gt_sub, sdp_sub)
+    map_rcnn = compute_map_per_frame(gt_sub, rcnn_dets)
+
+    # Avaliação de Tracking ingênuo
+    tracker = NaiveTracker(iou_threshold=0.3, max_lost_frames=15)
+    
+    tracker.reset()
+    pred_sdp = tracker.track_sequence(sdp_sub)
+    m_sdp = evaluate_tracking(gt_sub, pred_sdp)
+
+    tracker.reset()
+    pred_rcnn = tracker.track_sequence(rcnn_dets)
+    m_rcnn = evaluate_tracking(gt_sub, pred_rcnn)
+
+    SEP = "=" * 80
+    print("\n" + SEP)
+    print(f"TABELA 1.1b: COMPARACAO DAS DUAS FONTES EM DADOS REAIS ({os.path.basename(seq_path)})")
+    print(SEP)
+    print("{:<28} | {:<9} | {:<8} | {:<6} | {:<10} | {}".format(
+        "Fonte de Detecção", "mAP (Det)", "IDF1", "IDSW", "Razao IDs", "Diagnostico"
+    ))
+    print("-" * 80)
+    print("{:<28} | {:<9.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x | {}".format(
+        "Fonte 1 — Publica (SDP)", map_sdp, m_sdp["idf1"], m_sdp["id_switches"],
+        m_sdp["ratio_ids"], "Especializado em pedestres MOT"
+    ))
+    print("{:<28} | {:<9.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x | {}".format(
+        "Fonte 2 — Faster R-CNN (COCO)", map_rcnn, m_rcnn["idf1"], m_rcnn["id_switches"],
+        m_rcnn["ratio_ids"], "Detector COCO + custom_nms"
+    ))
+    print(SEP)
+    print("CONCLUSAO:")
+    print("1. Ambas as fontes foram avaliadas em imagens reais com NMS proprio.")
+    print("2. O SDP e mantido como FONTE PADRAO para o restante do PA2 pois oferece caixas")
+    print("   especializadas no benchmark MOT17, isolando o problema para a modelagem temporal.")
+    print(SEP + "\n")
+
+    return {
+        "seq_name": os.path.basename(seq_path),
+        "gt": gt_sub,
+        "sdp_dets": sdp_sub,
+        "rcnn_dets": rcnn_dets,
+        "map_sdp": map_sdp,
+        "map_rcnn": map_rcnn,
+        "m_sdp": m_sdp,
+        "m_rcnn": m_rcnn,
+        "sample_images": sample_images
+    }
+

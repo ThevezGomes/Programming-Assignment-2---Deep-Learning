@@ -10,7 +10,8 @@ from src.metrics import (
     compute_idf1,
     compute_id_switches_and_fragmentations,
     compute_map_per_frame,
-    evaluate_tracking
+    evaluate_tracking,
+    run_unit_tests
 )
 
 __all__ = [
@@ -20,8 +21,14 @@ __all__ = [
     "compute_idf1",
     "compute_id_switches_and_fragmentations",
     "compute_map_per_frame",
-    "evaluate_tracking"
+    "evaluate_tracking",
+    "run_unit_tests"
 ]
 
 if __name__ == "__main__":
-    print("Módulo de métricas carregado com sucesso.")
+    print("Executando validação unitária das métricas de rastreamento (Parte 0 - Item 3)...")
+    success = run_unit_tests(verbose=True)
+    if not success:
+        exit(1)
+    print("\nImplementação de métricas validada com sucesso.")
+
