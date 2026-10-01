@@ -228,7 +228,7 @@ class RNNTrack:
         self.age += 1
         self._predict_next(model, dt=dt)
 
-    def mark_missed(self, model, dt=1.0):
+    def mark_missed(self, model, dt=1.0, velocity_damping=1.0, sigma_inflation=0.0):
         """
         Sob oclusão: roda a RNN para frente em modo autoregressivo (free-running),
         mantendo a estimativa de movimento no espaço.
@@ -240,7 +240,18 @@ class RNNTrack:
         # Alimenta a própria previsão anterior na recorrência
         self.prev_box = self.last_box.copy()
         self.last_box = self.predicted_box.copy()
+        # Intervenção (Parte 4): Amortecimento de velocidade e inflação de incerteza sob oclusão
+        cx = (self.last_box[0] + self.last_box[2]/2)
+        cy = (self.last_box[1] + self.last_box[3]/2)
+        pcx = (self.prev_box[0] + self.prev_box[2]/2)
+        pcy = (self.prev_box[1] + self.prev_box[3]/2)
+        vx = (cx - pcx) * velocity_damping
+        vy = (cy - pcy) * velocity_damping
+        self.prev_box[0] = cx - vx - self.last_box[2]/2
+        self.prev_box[1] = cy - vy - self.last_box[3]/2
+        self.prev_box[2:] = self.last_box[2:]
         self._predict_next(model, dt=dt)
+        self.predicted_sigma += sigma_inflation
 
 
 class RNNMotionTracker:
@@ -257,6 +268,8 @@ class RNNMotionTracker:
         max_lost_frames: int = 15,
         matching_method: str = "hungarian",
         use_adaptive_gating: bool = True,
+        velocity_damping: float = 1.0,
+        sigma_inflation: float = 0.0,
         device: str = "cuda"
     ):
         if device == "cuda" and not torch.cuda.is_available():
@@ -281,6 +294,8 @@ class RNNMotionTracker:
         self.max_lost_frames = max_lost_frames
         self.matching_method = matching_method
         self.use_adaptive_gating = use_adaptive_gating
+        self.velocity_damping = velocity_damping
+        self.sigma_inflation = sigma_inflation
 
         self.next_id = 1
         self.tracks = []
@@ -288,6 +303,27 @@ class RNNMotionTracker:
     def reset(self):
         self.next_id = 1
         self.tracks = []
+
+    def _adaptive_threshold(self, track) -> float:
+        """
+        Portão adaptativo: relaxa o limiar de IoU proporcionalmente ao tempo de oclusão.
+        Sem correção (sigma_inflation=0): mantém o limiar base.
+        Com correção: reduz o limiar 0.01 por frame perdido (mínimo 0.10).
+        Isso permite que tracks ocluídas por muitos frames reacitem detecções mesmo
+        que a caixa prevista pela RNN tenha divergido ligeiramente da posição real.
+        """
+        if not self.use_adaptive_gating:
+            return self.iou_threshold
+        base = self.iou_threshold
+        if self.sigma_inflation > 0.0:
+            # Decai 0.01 por frame perdido, no máximo 0.20 de desconto
+            lost = getattr(track, "time_since_update", 0)
+            decay = min(0.20, 0.01 * lost * self.sigma_inflation * 10)
+            return max(0.10, base - decay)
+        else:
+            # Comportamento original: usa incerteza gaussiana prevista
+            uncertainty = float(np.mean(track.predicted_sigma))
+            return max(0.15, base - 0.1 * min(1.0, uncertainty))
 
     def step(self, detections: list or dict, frame_id: int, im_width: float = 1920.0,
              im_height: float = 1080.0, dt: float = 1.0):
@@ -313,12 +349,7 @@ class RNNMotionTracker:
                 row_ind, col_ind = linear_sum_assignment(-ious)
                 for r, c in zip(row_ind, col_ind):
                     track = candidate_tracks[r]
-                    # Portão adaptativo: relaxa o limiar de IoU se a incerteza prevista for maior
-                    thresh = self.iou_threshold
-                    if self.use_adaptive_gating:
-                        uncertainty = np.mean(track.predicted_sigma)
-                        thresh = max(0.15, self.iou_threshold - 0.1 * min(1.0, uncertainty))
-
+                    thresh = self._adaptive_threshold(track)
                     if ious[r, c] >= thresh:
                         track.update(det_boxes[c], frame_id, self.model, dt=dt)
                         matched_tracks.add(r)
@@ -328,9 +359,7 @@ class RNNMotionTracker:
                 for idx in flat_order:
                     r, c = np.unravel_index(idx, ious.shape)
                     track = candidate_tracks[r]
-                    thresh = self.iou_threshold
-                    if self.use_adaptive_gating:
-                        thresh = max(0.15, self.iou_threshold - 0.1 * min(1.0, np.mean(track.predicted_sigma)))
+                    thresh = self._adaptive_threshold(track)
                     if ious[r, c] < thresh:
                         break
                     if r not in matched_tracks and c not in matched_dets:
@@ -341,7 +370,7 @@ class RNNMotionTracker:
         # 1. Tracks não associadas (sob oclusão): rodam a RNN autoregressivamente
         for i, track in enumerate(candidate_tracks):
             if i not in matched_tracks:
-                track.mark_missed(self.model, dt=dt)
+                track.mark_missed(self.model, dt=dt, velocity_damping=self.velocity_damping, sigma_inflation=self.sigma_inflation)
                 if track.time_since_update > self.max_lost_frames:
                     track.state = "dead"
 
