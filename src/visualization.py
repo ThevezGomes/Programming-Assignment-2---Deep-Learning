@@ -495,3 +495,68 @@ def plot_part2_comparison_panel(
     return fig
 
 
+
+# ===========================================================================
+# PARTE 3 — Ablação (Eixo 1)
+# ===========================================================================
+
+def plot_ablation_eixo1(results_path: str = "results/ablation_eixo1.json", save_path: str = None):
+    """
+    Parte 3 (Eixo 1) — Plota a curva de IDF1 vs Comprimento da Janela (T) 
+    para as 3 arquiteturas (RNN, LSTM, GRU).
+    Mostra os resultados em média ± desvio padrão.
+    """
+    import json
+    import os
+    if not os.path.exists(results_path):
+        print(f"Arquivo não encontrado: {results_path}")
+        return None
+        
+    with open(results_path, "r") as f:
+        data = json.load(f)
+        
+    # Organiza os dados por célula
+    from collections import defaultdict
+    series = defaultdict(lambda: {"T": [], "mean": [], "std": []})
+    
+    for row in data:
+        cell = row["cell"].upper()
+        series[cell]["T"].append(row["T"])
+        series[cell]["mean"].append(row["idf1_mean"])
+        series[cell]["std"].append(row["idf1_std"])
+        
+    fig, ax = plt.subplots(figsize=(8, 5))
+    
+    colors = {"RNN": "#d95f02", "LSTM": "#1b9e77", "GRU": "#7570b3"}
+    markers = {"RNN": "o", "LSTM": "s", "GRU": "^"}
+    
+    for cell, vals in series.items():
+        T_arr = np.array(vals["T"])
+        mean_arr = np.array(vals["mean"])
+        std_arr = np.array(vals["std"])
+        
+        # Sorteia pelos T
+        idx = np.argsort(T_arr)
+        T_arr = T_arr[idx]
+        mean_arr = mean_arr[idx]
+        std_arr = std_arr[idx]
+        
+        ax.plot(T_arr, mean_arr, marker=markers[cell], color=colors[cell], lw=2, label=cell)
+        ax.fill_between(T_arr, mean_arr - std_arr, mean_arr + std_arr, color=colors[cell], alpha=0.2)
+        
+    ax.set_xticks([4, 8, 16, 32])
+    ax.set_xlabel("Comprimento da Janela de BPTT (T quadros)", fontsize=11, fontweight="bold")
+    ax.set_ylabel("Média do IDF1 (MOT17-09)", fontsize=11, fontweight="bold")
+    ax.set_title("Parte 3 (Eixo 1) — Ablação da Célula Recorrente e Janela de BPTT\n"
+                 "(RNN Simples colapsa em janelas longas por Vanishing Gradient)", fontsize=12, fontweight="bold")
+    
+    ax.legend(title="Arquitetura\n(~35k parâmetros)", framealpha=0.9)
+    ax.grid(axis="y", linestyle="--", alpha=0.6)
+    
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        print(f"Gráfico de ablação salvo em {save_path}")
+        
+    return fig

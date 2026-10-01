@@ -28,3 +28,7 @@ checkpoints/*.pt
 
 data/MOT17/
 data/
+
+checkpoints
+results
+docs/*.png

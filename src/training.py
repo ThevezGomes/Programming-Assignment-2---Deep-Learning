@@ -168,7 +168,7 @@ def train_motion_model(
             train_loss_acc += loss.item()
 
         # Decaimento do Teacher Forcing (Scheduled Sampling)
-        current_tf = max(0.2, current_tf - scheduled_sampling_decay)
+        current_tf = max(0.0, current_tf - scheduled_sampling_decay)
         scheduler.step()
 
         # Avaliação na Validação
