@@ -166,7 +166,7 @@ def run_generator_knobs_breakdown(
     ))
     print("-" * 78)
     obj_results = []
-    n_objs = [3, 6, 9, 13, 18]
+    n_objs = [3, 6, 13, 20, 30]
     for n in n_objs:
         frames, gt = generate_synthetic_video(
             num_frames=40, num_objects=n, frame_size=128, typical_velocity=2.0,
