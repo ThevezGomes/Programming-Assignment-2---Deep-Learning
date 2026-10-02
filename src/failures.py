@@ -472,11 +472,6 @@ def plot_failure_gallery(
         # Título
         fig.suptitle(case["title"], fontsize=10, fontweight="bold", y=1.02)
 
-        # Diagnóstico em caixa de texto abaixo
-        fig.text(0.5, -0.12, case["diagnosis"], ha="center", va="top",
-                 fontsize=7.5, wrap=True,
-                 bbox=dict(facecolor="#fffde7", edgecolor="#cccc00", alpha=0.9, pad=6),
-                 transform=fig.transFigure)
 
         plt.tight_layout()
         save_file = os.path.join(save_dir, f"parte4_falha{idx+1}_gt{gt_id}.png")

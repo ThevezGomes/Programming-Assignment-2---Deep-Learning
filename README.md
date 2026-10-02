@@ -1,7 +1,5 @@
 # Deep Learning: Programming Assignment 2 — Identidade ao longo do tempo: detecção, recorrência e rastreamento
 
-O objetivo deste repositório é atender aos requisitos do Programming Assignment 2 da disciplina Aprendizado Profundo da FGV EMAp.
-
 ## Integrantes do Grupo
 * Henrique Gabriel Gasparelo
 * José Thevez Gomes Guedes
@@ -69,45 +67,21 @@ Para baixar as imagens completas caso deseje renderizar vídeos (opcional para o
 
 ---
 
-## Parte 1 — Regras de Associação e Gestão do Ciclo de Vida (Item 4)
-
-O rastreador de linha de base (`NaiveTracker` em `src/tracker.py`) opera sem memória temporal recorrente, associando caixas entre quadros consecutivos ($t$ e $t-1$):
-
-1. **Matriz de Custo e Matching:**
-   * Calcula a matriz de sobreposição espacial por **IoU** (`box_iou_matrix` de autoria própria).
-   * Associação ótima 1-para-1 via **Algoritmo Húngaro** (`scipy.optimize.linear_sum_assignment(-ious)`), com opção de matching **Guloso** (ordenação decrescente por IoU).
-   * **Limiar de corte:** $\text{IoU} \ge 0.3$. Pares com sobreposição inferior a 0.3 são descartados para evitar falso pareamento.
-
-2. **Gestão do Ciclo de Vida:**
-   * **Nascimento:** Toda detecção que não é associada a nenhuma trajetória existente inicia uma nova track com um identificador numérico único incremental (`next_id += 1`).
-   * **Oclusão / Lost:** Trajetórias ativas que não recebem detecção no quadro atual acumulam um contador `time_since_update += 1` e passam para o estado `lost`.
-   * **Morte:** Se uma track permanecer mais de $k = 15$ quadros consecutivos sem observação (`time_since_update > max_lost_frames`), ela é marcada como `dead` e extinta permanentemente. Se o objeto reaparecer após $k$ quadros, ele receberá um novo ID (gerando fragmentação e ID switch).
-
----
-
 ## Comandos de Treinamento e Avaliação
 
-### 1. Treinamento (Trilha A — Modelo Temporal de Movimento)
-Para treinar a rede recorrente (LSTM) nas trajetórias de pedestres do MOT17 e salvar o checkpoint:
-```bash
-python3 -m src.training
-```
+Agora contamos com uma interface CLI centralizada (`main.py`) para facilitar o treinamento e a avaliação da rede (LSTM) contra o Baseline.
 
-### 2. Avaliação
-Para executar a validação das métricas e os testes unitários da Parte 0 (casos a, b, c):
+### Treinamento da LSTM (Trilha A)
+Para treinar a rede recorrente (LSTM com cabeça de incerteza) a partir do zero nas trajetórias de pedestres do MOT17:
 ```bash
-python3 metrics.py
+python3 main.py train
 ```
+*(Você pode customizar o treino com flags: `--epochs 10 --seq_len 32`)*
 
-Para reproduzir a avaliação completa do baseline ingênuo nas sequências do MOT17 (Parte 1):
+### Avaliação (Tabela Detalhada)
+Para avaliar a LSTM treinada (já com as intervenções de amortecimento e inflação da Parte 4 ligadas por padrão) exibindo uma tabela detalhada de métricas (IDF1, ID Switches, Fragmentações, etc.) por sequência:
 ```bash
-python3 -c "from src.tracker import NaiveTracker; from src.evaluation import run_mot17_baseline; run_mot17_baseline('data/MOT17/train', NaiveTracker())"
-```
-
-### 3. Teste de Estresse (Parte 5 — Degradação da Qualidade do Detector)
-Para reproduzir o teste de estresse em 4 intensidades (Controle, Leve, Moderada e Severa) confrontando o Baseline Ingênuo e o Modelo Temporal Recorrente (LSTM):
-```bash
-python3 -m src.stress
+python3 main.py eval
 ```
 
 ---
