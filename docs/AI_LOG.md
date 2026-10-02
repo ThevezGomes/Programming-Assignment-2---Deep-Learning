@@ -25,4 +25,4 @@
 
 * **Dúvidas gerais de código e implementações**
 
-
+* **Dúvidas conceituais**
