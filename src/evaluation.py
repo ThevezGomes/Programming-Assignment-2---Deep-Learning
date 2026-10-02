@@ -427,15 +427,6 @@ def compare_detection_sources(
     print("{:<40} | {:<12} | {}".format(
         "Fonte 2 — Torchvision Faster R-CNN", n2,
         "Nao — gap de dominio (elipses != pessoas)"))
-    print(SEP)
-    print()
-    print("CONCLUSAO: O Faster R-CNN COCO nao detecta elipses sinteticas (gap de dominio).")
-    print("Para frames MOT17 reais ele detectaria pessoas, mas com menor precisao que o SDP")
-    print("(mais falsos positivos: bolsas, ciclistas, veiculos parciais).")
-    print()
-    print("Por isso adotamos o SDP (mAP=0.754, especializado em pedestres)")
-    print("como FONTE PADRAO para toda a avaliacao do PA2.")
-    print("O codigo do Faster R-CNN + custom_nms esta implementado em src/inference.py.")
 
     return {
         "frames": frames,
@@ -521,12 +512,6 @@ def compare_real_detection_sources(
         "Fonte 2 — Faster R-CNN (COCO)", map_rcnn, m_rcnn["idf1"], m_rcnn["id_switches"],
         m_rcnn["ratio_ids"], "Detector COCO + custom_nms"
     ))
-    print(SEP)
-    print("CONCLUSAO:")
-    print("1. Ambas as fontes foram avaliadas em imagens reais com NMS proprio.")
-    print("2. O SDP e mantido como FONTE PADRAO para o restante do PA2 pois oferece caixas")
-    print("   especializadas no benchmark MOT17, isolando o problema para a modelagem temporal.")
-    print(SEP + "\n")
 
     return {
         "seq_name": os.path.basename(seq_path),

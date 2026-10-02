@@ -419,7 +419,6 @@ def run_unit_tests(verbose: bool = True):
         print(f"\n{'[PASS]' if ok_b else '[FAIL]'} Caso (b) -- Troca de 2 identidades a partir de k=11")
         print(f"       IDF1        = {res_b['idf1']:.4f}  (esperado: ~0.5000)")
         print(f"       ID Switches = {res_b['id_switches']}  (esperado: 2)")
-        print("       DIAGNOSTICO: tracker CONFUNDIU identidades dos dois objetos")
 
     # --- CASO (c): Track unica partida em dois IDs ---
     gt_c = {f: {1: np.array([10 + f, 20 + f, 20, 30], dtype=np.float32)}
@@ -441,10 +440,6 @@ def run_unit_tests(verbose: bool = True):
         print(f"       IDF1           = {res_c['idf1']:.4f}  (esperado: ~0.5000)")
         print(f"       ID Switches    = {res_c['id_switches']}  (esperado: 1)")
         print(f"       IDs GT / Pred  = {res_c['unique_gt_ids']} GT / {res_c['unique_pred_ids']} Pred")
-        print("       DIAGNOSTICO: contagem INFLADA (2 IDs pred para 1 objeto real)")
-        print("\n       Diferenca entre (b) e (c):")
-        print("       (b) 2 objetos trocados   => switches=2, qtd de IDs correta")
-        print("       (c) 1 objeto fragmentado => switches=1, qtd de IDs inflada")
 
     if verbose:
         print(f"\n{SEP}")
