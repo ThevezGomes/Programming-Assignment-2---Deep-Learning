@@ -4,14 +4,19 @@ Parte 5 — Teste de Estresse: Degradação da Qualidade do Detector.
 
 Avalia o comportamento do rastreador sob perturbações controladas nas detecções
 públicas do MOT17 (descarte p%, ruído nas caixas e injeção de falsos positivos)
-em 3 intensidades (mais o controle original), medindo simultaneamente mAP e IDF1
-para determinar se a recorrência temporal absorve ou amplifica as falhas do detector.
+em 4 patamares (Controle, Leve, Moderada, Severa) com 3 sementes aleatórias por nível,
+avaliado na sequência MOT17-09 e também na MOT17-11.
+
+Inclui controle justo: NaiveTracker com a mesma relaxação adaptativa de limiar,
+separando o efeito da recorrência do efeito do limiar relaxado.
+Métricas avaliadas no protocolo unificado EVAL_IOU = 0.5.
 """
 
 import os
 import json
 import numpy as np
 
+from src.config import EVAL_IOU, DEFAULT_TRACKER_IOU, DEFAULT_MAX_LOST_FRAMES, FINAL_CHECKPOINT_PATH
 from src.data import load_mot17_sequence
 from src.tracker import NaiveTracker, RNNMotionTracker
 from src.metrics import evaluate_tracking, compute_map_per_frame
@@ -88,13 +93,11 @@ def degrade_mot17_detections(
             conf = float(d[4]) if len(d) > 4 else 1.0
 
             if noise_std > 0.0:
-                # Perturba centroide e dimensões
                 x += rng.normal(0, noise_std)
                 y += rng.normal(0, noise_std)
                 w += rng.normal(0, noise_std * 0.5)
                 h += rng.normal(0, noise_std * 0.5)
 
-            # Garante limites válidos dentro da resolução
             x = float(np.clip(x, 0, im_w - 2))
             y = float(np.clip(y, 0, im_h - 2))
             w = float(np.clip(w, 4, im_w - x))
@@ -106,7 +109,6 @@ def degrade_mot17_detections(
         if fp_rate > 0.0 and len(orig_dets) > 0:
             n_fp = rng.poisson(fp_rate * len(orig_dets))
             for _ in range(int(n_fp)):
-                # Dimensões realistas de pedestres em MOT17
                 fp_w = float(rng.uniform(25, 75))
                 aspect_ratio = float(rng.uniform(2.0, 3.2))
                 fp_h = float(min(im_h - 2, fp_w * aspect_ratio))
@@ -121,142 +123,223 @@ def degrade_mot17_detections(
 
 
 def run_detector_stress_experiment(
-    seq_path: str = "data/MOT17/train/MOT17-09-SDP",
-    model_path: str = "checkpoints/motion_lstm_best.pt",
+    seq_path: str or list = "data/MOT17/train/MOT17-09-SDP",
+    model_path: str = FINAL_CHECKPOINT_PATH,
     levels: list = None,
+    seeds: list = None,
     velocity_damping: float = 0.85,
     sigma_inflation: float = 0.30,
-    iou_threshold: float = 0.30,
-    max_lost_frames: int = 15,
-    seed: int = 42,
+    iou_threshold: float = DEFAULT_TRACKER_IOU,
+    max_lost_frames: int = DEFAULT_MAX_LOST_FRAMES,
     save_results_path: str = "results/stress_detector.json",
     save_plot_path: str = "docs/parte5_stress_detector.png"
 ) -> dict:
     """
-    Executa o teste de estresse da Parte 5 sobre uma sequência MOT17:
-    - Avalia NaiveTracker vs RNNMotionTracker (LSTM) em 4 patamares de qualidade.
-    - Mede mAP por quadro e métricas temporais (IDF1, IDSW, Frag, Ratio).
-    - Salva os resultados estruturados e renderiza os gráficos.
+    Executa o teste de estresse da Parte 5 com múltiplas sementes e controle justo:
+    - Compara Naive Tracker (padrão), Naive Tracker Relaxado (controle de limiar) e LSTM.
+    - Avalia na sequência fornecida (ou lista de sequências MOT17-09 e MOT17-11).
+    - Métricas avaliadas com EVAL_IOU = 0.5.
+    - Retorna médias ± desvios, retenção relativa e veredito derivado dos números.
     """
     if levels is None:
         levels = DEFAULT_STRESS_LEVELS
+    if seeds is None:
+        seeds = [42, 100, 2026]
 
-    if not os.path.exists(seq_path):
-        raise FileNotFoundError(f"Sequência não encontrada: {seq_path}")
+    if isinstance(seq_path, str):
+        target_seqs = [seq_path]
+    else:
+        target_seqs = list(seq_path)
 
-    gt_by_frame, det_by_frame, info = load_mot17_sequence(seq_path)
-    im_w = int(info.get("imWidth", 1920))
-    im_h = int(info.get("imHeight", 1080))
-    seq_name = info.get("name", os.path.basename(seq_path))
+    all_sequences_results = {}
 
-    SEP = "=" * 94
-    print(SEP)
-    print(f"PARTE 5: TESTE DE ESTRESSE — DEGRADAÇÃO DA QUALIDADE DO DETECTOR")
-    print(f"Sequência: {seq_name} ({im_w}x{im_h}) | Checkpoint: {os.path.basename(model_path)}")
-    print(f"Configuração LSTM: velocity_damping={velocity_damping}, sigma_inflation={sigma_inflation}")
-    print(SEP)
-    header = f"{'Nível':<10} | {'mAP (Det)':<9} | {'IDF1 (Naive)':<12} | {'IDF1 (LSTM)':<11} | {'Delta IDF1':<10} | {'IDSW (N/L)':<10} | {'Diagnóstico'}"
-    print(header)
-    print("-" * 94)
+    for s_path in target_seqs:
+        if not os.path.exists(s_path):
+            alt = os.path.join(os.path.dirname(s_path), "data", "MOT17", "train", os.path.basename(s_path))
+            if os.path.exists(alt):
+                s_path = alt
+            else:
+                print(f"[SKIP] Sequência não encontrada: {s_path}")
+                continue
 
-    results_table = []
+        gt_by_frame, det_by_frame, info = load_mot17_sequence(s_path)
+        im_w = int(info.get("imWidth", 1920))
+        im_h = int(info.get("imHeight", 1080))
+        seq_name = info.get("name", os.path.basename(s_path))
 
-    for lvl in levels:
-        degraded_dets = degrade_mot17_detections(
-            det_by_frame=det_by_frame,
-            im_w=im_w,
-            im_h=im_h,
-            drop_prob=lvl["drop_prob"],
-            noise_std=lvl["noise_std"],
-            fp_rate=lvl["fp_rate"],
-            seed=seed
-        )
+        SEP = "=" * 104
+        print("\n" + SEP)
+        print(f"PARTE 5: TESTE DE ESTRESSE DO DETECTOR — {seq_name} (3 seeds por nível)")
+        print(f"Protocolo de Avaliação: EVAL_IOU = {EVAL_IOU} | Checkpoint: {os.path.basename(model_path)}")
+        print(SEP)
+        print("{:<10} | {:<12} | {:<12} | {:<13} | {:<12} | {:<11} | {}".format(
+            "Nível", "mAP(0.5)", "IDF1 Naive", "IDF1 NaiveRel", "IDF1 LSTM", "Delta IDF1", "Veredito Derivado"
+        ))
+        print("-" * 104)
 
-        # 1. mAP do detector degradado
-        map_score = float(compute_map_per_frame(gt_by_frame, degraded_dets, iou_threshold=0.5))
+        results_table = []
+        control_lstm_idf1 = None
 
-        # 2. Avaliação do Baseline Ingênuo
-        naive = NaiveTracker(
-            iou_threshold=iou_threshold,
-            max_lost_frames=max_lost_frames,
-            matching_method="hungarian"
-        )
-        preds_naive = naive.track_sequence(degraded_dets)
-        m_naive = evaluate_tracking(gt_by_frame, preds_naive, iou_threshold=iou_threshold)
+        for lvl in levels:
+            lvl_seeds = [seeds[0]] if (lvl["drop_prob"] == 0 and lvl["noise_std"] == 0 and lvl["fp_rate"] == 0) else seeds
 
-        # 3. Avaliação do Modelo Recorrente (Trilha A com correção da Parte 4)
-        lstm = RNNMotionTracker(
-            model=model_path,
-            iou_threshold=iou_threshold,
-            max_lost_frames=max_lost_frames,
-            velocity_damping=velocity_damping,
-            sigma_inflation=sigma_inflation,
-            use_adaptive_gating=True
-        )
-        preds_lstm = lstm.track_sequence(degraded_dets)
-        m_lstm = evaluate_tracking(gt_by_frame, preds_lstm, iou_threshold=iou_threshold)
+            map_list = []
+            naive_idf1_list = []
+            naive_rel_idf1_list = []
+            lstm_idf1_list = []
+            naive_idsw_list = []
+            lstm_idsw_list = []
+            delta_idf1_list = []
 
-        delta_idf1 = m_lstm["idf1"] - m_naive["idf1"]
-        delta_idsw = m_lstm["id_switches"] - m_naive["id_switches"]
+            for s in lvl_seeds:
+                degraded_dets = degrade_mot17_detections(
+                    det_by_frame=det_by_frame,
+                    im_w=im_w,
+                    im_h=im_h,
+                    drop_prob=lvl["drop_prob"],
+                    noise_std=lvl["noise_std"],
+                    fp_rate=lvl["fp_rate"],
+                    seed=s
+                )
 
-        if delta_idf1 >= 0.01:
-            diag = "Absorção clara (LSTM amortece a perda)"
-        elif delta_idf1 >= 0:
-            diag = "Absorção moderada (LSTM estável)"
-        else:
-            diag = "Amplificação do erro"
+                mp = compute_map_per_frame(gt_by_frame, degraded_dets, iou_threshold=EVAL_IOU)
+                map_list.append(mp)
 
-        idsw_str = f"{m_naive['id_switches']}/{m_lstm['id_switches']}"
-        print(f"{lvl['level']:<10} | {map_score:<9.3f} | {m_naive['idf1']:<12.3f} | {m_lstm['idf1']:<11.3f} | {delta_idf1:+10.3f} | {idsw_str:<10} | {diag}")
+                # 1. Baseline Naive Padrão
+                naive = NaiveTracker(iou_threshold=iou_threshold, max_lost_frames=max_lost_frames)
+                preds_naive = naive.track_sequence(degraded_dets)
+                m_naive = evaluate_tracking(gt_by_frame, preds_naive, iou_threshold=EVAL_IOU)
+                naive_idf1_list.append(m_naive["idf1"])
+                naive_idsw_list.append(m_naive["id_switches"])
 
-        entry = {
-            "level": lvl["level"],
-            "name": lvl["name"],
-            "description": lvl["description"],
-            "drop_prob": lvl["drop_prob"],
-            "noise_std": lvl["noise_std"],
-            "fp_rate": lvl["fp_rate"],
-            "map_score": map_score,
-            "naive": {
-                "idf1": float(m_naive["idf1"]),
-                "id_switches": int(m_naive["id_switches"]),
-                "fragmentations": int(m_naive["fragmentations"]),
-                "ratio_ids": float(m_naive["ratio_ids"])
-            },
-            "lstm": {
-                "idf1": float(m_lstm["idf1"]),
-                "id_switches": int(m_lstm["id_switches"]),
-                "fragmentations": int(m_lstm["fragmentations"]),
-                "ratio_ids": float(m_lstm["ratio_ids"])
-            },
-            "delta_idf1": float(delta_idf1),
-            "delta_idsw": int(delta_idsw),
-            "diagnostico": diag
-        }
-        results_table.append(entry)
+                # 2. Controle Justo: Naive com a mesma relaxação de limiar
+                naive_rel = NaiveTracker(
+                    iou_threshold=iou_threshold,
+                    max_lost_frames=max_lost_frames,
+                    adaptive_decay=0.01
+                )
+                preds_naive_rel = naive_rel.track_sequence(degraded_dets)
+                m_naive_rel = evaluate_tracking(gt_by_frame, preds_naive_rel, iou_threshold=EVAL_IOU)
+                naive_rel_idf1_list.append(m_naive_rel["idf1"])
 
-    print(SEP)
+                # 3. Trilha A (LSTM com portão adaptativo e incerteza)
+                lstm = RNNMotionTracker(
+                    model=model_path,
+                    iou_threshold=iou_threshold,
+                    max_lost_frames=max_lost_frames,
+                    velocity_damping=velocity_damping,
+                    sigma_inflation=sigma_inflation,
+                    use_adaptive_gating=True
+                )
+                preds_lstm = lstm.track_sequence(degraded_dets, im_width=im_w, im_height=im_h)
+                m_lstm = evaluate_tracking(gt_by_frame, preds_lstm, iou_threshold=EVAL_IOU)
+                lstm_idf1_list.append(m_lstm["idf1"])
+                lstm_idsw_list.append(m_lstm["id_switches"])
 
-    # Salva o arquivo de resultados JSON
+                delta_idf1_list.append(m_lstm["idf1"] - m_naive["idf1"])
+
+            mean_map = float(np.mean(map_list))
+            std_map = float(np.std(map_list))
+            mean_naive = float(np.mean(naive_idf1_list))
+            std_naive = float(np.std(naive_idf1_list))
+            mean_naive_rel = float(np.mean(naive_rel_idf1_list))
+            std_naive_rel = float(np.std(naive_rel_idf1_list))
+            mean_lstm = float(np.mean(lstm_idf1_list))
+            std_lstm = float(np.std(lstm_idf1_list))
+            mean_delta = float(np.mean(delta_idf1_list))
+            std_delta = float(np.std(delta_idf1_list))
+
+            mean_idsw_naive = float(np.mean(naive_idsw_list))
+            mean_idsw_lstm = float(np.mean(lstm_idsw_list))
+
+            if lvl["level"] == "Controle":
+                control_lstm_idf1 = mean_lstm
+                retention = 1.0
+                abs_loss = 0.0
+            else:
+                retention = (mean_lstm / control_lstm_idf1) if control_lstm_idf1 else 0.0
+                abs_loss = (control_lstm_idf1 - mean_lstm) if control_lstm_idf1 else 0.0
+
+            # Veredito derivado matematicamente dos números medidos
+            if mean_delta > std_delta and mean_delta >= 0.008:
+                veredito = "Absorve (ganho além da variância)"
+            elif abs(mean_delta) <= (std_delta + 1e-4):
+                veredito = "Neutro (dentro da variância das seeds)"
+            else:
+                veredito = "Amplifica erro"
+
+            map_str = f"{mean_map:.3f}" if std_map < 1e-3 else f"{mean_map:.3f}±{std_map:.3f}"
+            naive_str = f"{mean_naive:.3f}" if std_naive < 1e-3 else f"{mean_naive:.3f}±{std_naive:.3f}"
+            naive_rel_str = f"{mean_naive_rel:.3f}" if std_naive_rel < 1e-3 else f"{mean_naive_rel:.3f}±{std_naive_rel:.3f}"
+            lstm_str = f"{mean_lstm:.3f}" if std_lstm < 1e-3 else f"{mean_lstm:.3f}±{std_lstm:.3f}"
+            delta_str = f"{mean_delta:+.3f}" if std_delta < 1e-3 else f"{mean_delta:+.3f}±{std_delta:.3f}"
+
+            print("{:<10} | {:<12} | {:<12} | {:<13} | {:<12} | {:<11} | {}".format(
+                lvl["level"], map_str, naive_str, naive_rel_str, lstm_str, delta_str, veredito
+            ))
+
+            results_table.append({
+                "level": lvl["level"],
+                "name": lvl["name"],
+                "description": lvl["description"],
+                "drop_prob": lvl["drop_prob"],
+                "noise_std": lvl["noise_std"],
+                "fp_rate": lvl["fp_rate"],
+                "map_mean": mean_map,
+                "map_std": std_map,
+                "map_score": mean_map,
+                "naive": {
+                    "idf1": mean_naive,
+                    "idf1_std": std_naive,
+                    "id_switches": int(round(mean_idsw_naive)),
+                },
+                "naive_relaxed": {
+                    "idf1": mean_naive_rel,
+                    "idf1_std": std_naive_rel,
+                },
+                "lstm": {
+                    "idf1": mean_lstm,
+                    "idf1_std": std_lstm,
+                    "id_switches": int(round(mean_idsw_lstm)),
+                },
+                "delta_idf1": mean_delta,
+                "delta_idf1_std": std_delta,
+                "retention_relative": retention,
+                "absolute_loss": abs_loss,
+                "veredito": veredito,
+                "diagnostico": veredito
+            })
+
+        print(SEP)
+        all_sequences_results[seq_name] = results_table
+
+    # Se apenas uma sequência foi executada, mantém formato de retorno plano para retrocompatibilidade
+    primary_results = list(all_sequences_results.values())[0] if all_sequences_results else []
+    primary_seq = list(all_sequences_results.keys())[0] if all_sequences_results else ""
+
     if save_results_path:
         os.makedirs(os.path.dirname(save_results_path), exist_ok=True)
         payload = {
-            "sequence": seq_name,
             "model_path": model_path,
             "velocity_damping": velocity_damping,
             "sigma_inflation": sigma_inflation,
-            "results": results_table
+            "eval_iou": EVAL_IOU,
+            "sequences": all_sequences_results,
+            "results": primary_results
         }
         with open(save_results_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
-        print(f"Resultados salvos em: {save_results_path}")
+        print(f"Resultados do teste de estresse salvos em: {save_results_path}")
 
-    # Gera visualização gráfica se especificado
-    if save_plot_path:
+    if save_plot_path and primary_results:
         from src.visualization import plot_stress_detector_results
-        plot_stress_detector_results(results_table, seq_name=seq_name, save_path=save_plot_path)
+        plot_stress_detector_results(primary_results, seq_name=primary_seq, save_path=save_plot_path)
 
-    return {"sequence": seq_name, "results": results_table}
+    return {
+        "sequence": primary_seq,
+        "results": primary_results,
+        "all_sequences": all_sequences_results
+    }
 
 
 if __name__ == "__main__":

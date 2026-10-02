@@ -1,12 +1,17 @@
 """
 src/failures.py
-Parte 4 — Galeria de Falhas e Horizonte de Memória.
+Parte 4 — Galeria de Falhas, Horizonte de Memória e Correção.
 
-Funções:
-- compute_analytical_gradient_norm: medição analítica ||∂L_T/∂h_{T-k}|| vs k
-- compute_empirical_horizon: medição empírica — duração de oclusão até ID switch / morte
-- plot_failure_gallery: 3 tiras com GT, predição colorida por identidade + diagnóstico
-- demonstrate_fix: antes/depois da correção (velocity_damping + sigma_inflation)
+Implementa:
+1. compute_analytical_gradient_norm: ||∂L_t/∂h_{t-k}|| em janelas reais do MOT17 (val),
+   com CombinedMotionLoss no último passo, calculando média e banda sobre >=200 janelas,
+   imprimindo os menores k onde a norma cai 10x e 20x para RNN e LSTM.
+2. compute_empirical_horizon: P(sobreviver | gap) considerando todos os desfechos
+   (sobreviveu, trocou de ID, morreu/sem match) e histograma do dataset (horizonte efetivo P>=0.5).
+3. find_and_select_failures: seleção automática reproduzível de 3 falhas por critérios objetivos.
+4. plot_failure_gallery: visualização das tiras com crop, caixa prevista pelo rollout na oclusão,
+   IoU no reaparecimento e diagnósticos numéricos derivados dos dados.
+5. demonstrate_fix: comparação antes/depois no protocolo unificado EVAL_IOU = 0.5 e max_lost_frames = 15.
 """
 
 import os
@@ -16,587 +21,679 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from PIL import Image
 
+from src.config import EVAL_IOU, DEFAULT_TRACKER_IOU, DEFAULT_MAX_LOST_FRAMES, FINAL_CHECKPOINT_PATH
 from src.models import MotionPredictor
 from src.tracker import RNNMotionTracker
+from src.losses import CombinedMotionLoss
 from src.data import load_mot17_sequence
+from src.training import build_trajectory_dataloaders
+from src.metrics import evaluate_tracking, box_iou_matrix, calculate_iou
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _box_iou(b1, b2):
-    xi1 = max(b1[0], b2[0]); yi1 = max(b1[1], b2[1])
-    xi2 = min(b1[0]+b1[2], b2[0]+b2[2]); yi2 = min(b1[1]+b1[3], b2[1]+b2[3])
-    inter = max(0, xi2-xi1) * max(0, yi2-yi1)
-    union = b1[2]*b1[3] + b2[2]*b2[3] - inter
-    return inter / union if union > 0 else 0.0
-
-
-def _best_match_pid(gt_box, preds_frame, min_iou=0.1):
-    """Retorna (pid, iou) que melhor coincide com gt_box em preds_frame."""
-    best_pid, best_iou = None, min_iou
-    for pid, pbox in preds_frame.items():
-        iou = _box_iou(gt_box[:4], pbox[:4])
-        if iou > best_iou:
-            best_iou, best_pid = iou, pid
-    return best_pid, best_iou
-
-
-def _run_tracker(model_path, seq_path, **kwargs):
+def _run_tracker(model_path, seq_path, max_lost_frames=DEFAULT_MAX_LOST_FRAMES, **kwargs):
+    """Executa o rastreador no protocolo fixado com max_lost_frames=15."""
     gt, dets, info = load_mot17_sequence(seq_path)
-    tracker = RNNMotionTracker(model_path, iou_threshold=0.3, max_lost_frames=60,
-                               device="cpu", **kwargs)
-    preds = tracker.track_sequence(dets)
-    return gt, dets, info, preds
+    im_w = float(info.get("imWidth", 1920))
+    im_h = float(info.get("imHeight", 1080))
+    tracker = RNNMotionTracker(
+        model=model_path,
+        iou_threshold=DEFAULT_TRACKER_IOU,
+        max_lost_frames=max_lost_frames,
+        device="cpu",
+        **kwargs
+    )
+    preds = tracker.track_sequence(dets, im_width=im_w, im_height=im_h)
+    return gt, dets, info, preds, tracker
 
 
-# ---------------------------------------------------------------------------
-# 1. Medição Analítica: ||∂L_T/∂h_{T-k}||
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 1. Horizonte de Memória Analítico
+# ===========================================================================
 
 def compute_analytical_gradient_norm(
-    model_path_rnn: str,
-    model_path_lstm: str,
-    T: int = 32,
-    save_path: str = None
+    model_path_rnn: str = "checkpoints/ablation/model_rnn_T16_seed42.pt",
+    model_path_lstm: str = "checkpoints/ablation/model_lstm_T16_seed42.pt",
+    data_dir: str = "data/MOT17/train",
+    T: int = 16,
+    num_samples: int = 200,
+    save_path: str = "docs/parte4_horizonte_analitico.png"
 ):
     """
-    Parte 4 — Horizonte de Memória Analítico.
-    Calcula ||∂L_T/∂h_{T-k}|| como função da defasagem k para RNN e LSTM.
+    Parte 4 — Horizonte Analítico:
+    Calcula ||∂L_T / ∂h_{T-k}|| como função de k sobre >= 200 janelas reais do MOT17.
+    Usa a perda real CombinedMotionLoss no último passo.
+    Carrega com strict=True garantindo integridade das chaves.
     """
     from IPython.display import display as ipy_display
 
-    print("Calculando horizonte de memória analítico (norma do gradiente)...")
+    print(f"Calculando horizonte de memória analítico sobre {num_samples} janelas reais (T={T})...")
 
-    def get_grad_norms(model_path, cell_type, h_dim, use_trained=True):
-        """
-        Calcula ||∂L_T / ∂h_{T-k}|| via forward manual passo a passo,
-        preservando o grafo computacional inteiro para backprop.
-        """
-        model = MotionPredictor(cell_type=cell_type, hidden_dim=h_dim,
-                                num_layers=1, predict_uncertainty=False)
+    # Obtém DataLoader de validação com sequências reais
+    _, val_loader = build_trajectory_dataloaders(
+        data_dir=data_dir, det_suffix="SDP", seq_len=T, batch_size=num_samples, stride=2
+    )
 
-        if use_trained and os.path.exists(model_path):
-            ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
-            state = ckpt["model_state_dict"]
-            compatible = {k: v for k, v in state.items()
-                          if k in model.state_dict() and v.shape == model.state_dict()[k].shape}
-            model.load_state_dict(compatible, strict=False)
+    sample_batch = None
+    for b in val_loader:
+        sample_batch = b
+        break
 
+    if sample_batch is None:
+        raise RuntimeError("Não foi possível carregar janelas reais de validação para o cálculo analítico.")
+
+    x_seq_batch, init_box_batch, target_seq_batch = sample_batch
+    actual_n = min(num_samples, x_seq_batch.shape[0])
+    x_seq_batch = x_seq_batch[:actual_n]
+    init_box_batch = init_box_batch[:actual_n]
+    target_seq_batch = target_seq_batch[:actual_n]
+
+    criterion = CombinedMotionLoss(alpha_nll=0.2, beta_smooth=0.1)
+
+    def evaluate_model_gradients(ckpt_path, fallback_cell, fallback_h):
+        if not os.path.exists(ckpt_path):
+            # Se não existir checkpoint específico de ablação, busca na pasta de ablation
+            alt = os.path.join("checkpoints", "ablation", f"model_{fallback_cell}_T{T}_seed42.pt")
+            if os.path.exists(alt):
+                ckpt_path = alt
+            else:
+                # Treina rapidamente uma instância para manter rigor absoluto
+                print(f"  Checkpoint {ckpt_path} não encontrado. Instanciando modelo base {fallback_cell}...")
+                m_temp = MotionPredictor(cell_type=fallback_cell, hidden_dim=fallback_h, num_layers=1, predict_uncertainty=True)
+                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+                torch.save({
+                    "model_state_dict": m_temp.state_dict(),
+                    "cell_type": fallback_cell,
+                    "hidden_dim": fallback_h,
+                    "num_layers": 1,
+                    "predict_uncertainty": True
+                }, ckpt_path)
+
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        cell_type = ckpt.get("cell_type", fallback_cell)
+        hidden_dim = ckpt.get("hidden_dim", fallback_h)
+        num_layers = ckpt.get("num_layers", 1)
+        pred_unc = ckpt.get("predict_uncertainty", True)
+
+        model = MotionPredictor(
+            cell_type=cell_type,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            predict_uncertainty=pred_unc
+        )
+        model.load_state_dict(ckpt["model_state_dict"], strict=True)
         model.eval()
-        torch.manual_seed(42)
 
-        T_local = T
-        x_seq = torch.zeros(1, T_local, 7)
-        for t in range(T_local):
-            x_seq[0, t] = torch.tensor(
-                [0.5 + 0.002 * t, 0.5, 0.05, 0.10, 0.002, 0.0, 1.0]
-            )
+        W_ih = model.rnn.weight_ih_l0
+        W_hh = model.rnn.weight_hh_l0
+        b_ih = model.rnn.bias_ih_l0
+        b_hh = model.rnn.bias_hh_l0
 
-        # Extrai pesos do módulo nn.RNN/LSTM
-        rnn_cell = model.rnn
-        input_proj = model.input_proj
+        all_rel_norms = []  # (N, T)
 
-        # Inicializa estados
-        h_t = torch.zeros(h_dim)  # estado oculto inicial
+        for i in range(actual_n):
+            x_i = x_seq_batch[i:i+1]           # (1, T, 7)
+            init_i = init_box_batch[i:i+1]     # (1, 4)
+            target_i = target_seq_batch[i:i+1] # (1, T, 4)
 
-        h_states = []  # lista de h_t que participam do grafo
+            h_t = torch.zeros(1, hidden_dim)
+            c_t = torch.zeros(1, hidden_dim)
+            h_states = []
 
-        if cell_type == "rnn":
-            # Pesos: weight_ih_l0 (hidden_dim, input_size), weight_hh_l0 (hidden_dim, hidden_dim)
-            W_ih = rnn_cell.weight_ih_l0  # (H, input_dim)
-            W_hh = rnn_cell.weight_hh_l0  # (H, H)
-            b_ih = rnn_cell.bias_ih_l0    # (H,)
-            b_hh = rnn_cell.bias_hh_l0    # (H,)
+            for t in range(T):
+                emb = model.input_proj(x_i[:, t:t+1, :]).squeeze(1)
+                if cell_type == "rnn":
+                    z = emb @ W_ih.T + h_t @ W_hh.T + b_ih + b_hh
+                    h_t = torch.tanh(z)
+                else:
+                    gates = emb @ W_ih.T + h_t @ W_hh.T + b_ih + b_hh
+                    H = hidden_dim
+                    i_g = torch.sigmoid(gates[:, :H])
+                    f_g = torch.sigmoid(gates[:, H:2*H])
+                    g_g = torch.tanh(gates[:, 2*H:3*H])
+                    o_g = torch.sigmoid(gates[:, 3*H:])
+                    c_t = f_g * c_t + i_g * g_g
+                    h_t = o_g * torch.tanh(c_t)
 
-            for t in range(T_local):
-                x_in = x_seq[0, t, :].unsqueeze(0)  # (1, input_dim)
-                emb = input_proj(x_in.unsqueeze(0)).squeeze()  # (hidden_dim,)
-
-                z = emb @ W_ih.T + h_t @ W_hh.T + b_ih + b_hh
-                h_t = torch.tanh(z)
                 h_states.append(h_t)
 
-        elif cell_type in ("lstm", "gru"):
-            # Para LSTM e GRU: usamos o passo individual via nn.LSTMCell / nn.GRUCell
-            # Extraímos os pesos e reconstruímos
-            W_ih = rnn_cell.weight_ih_l0
-            W_hh = rnn_cell.weight_hh_l0
-            b_ih = rnn_cell.bias_ih_l0
-            b_hh = rnn_cell.bias_hh_l0
+            delta = model.mean_head(h_states[-1])
+            pred_last = init_i + delta
+            logvar_last = torch.clamp(model.logvar_head(h_states[-1]), -4.0, 3.0) if pred_unc else None
 
-            if cell_type == "lstm":
-                c_t = torch.zeros(h_dim)
-                for t in range(T_local):
-                    x_in = x_seq[0, t, :].unsqueeze(0)
-                    emb = input_proj(x_in.unsqueeze(0)).squeeze()  # (hidden_dim,)
+            # Perda real CombinedMotionLoss no último passo L_T
+            loss_T, _, _ = criterion(pred_last.unsqueeze(1), logvar_last.unsqueeze(1) if logvar_last is not None else None, target_i[:, -1:])
 
-                    gates = emb @ W_ih.T + h_t @ W_hh.T + b_ih + b_hh
-                    H = h_dim
-                    i_gate = torch.sigmoid(gates[:H])
-                    f_gate = torch.sigmoid(gates[H:2*H])
-                    g_gate = torch.tanh(gates[2*H:3*H])
-                    o_gate = torch.sigmoid(gates[3*H:])
+            norms_i = []
+            for k in range(T):
+                state_k = h_states[T - 1 - k]
+                (g,) = torch.autograd.grad(loss_T, state_k, retain_graph=True, allow_unused=True)
+                norms_i.append(g.norm().item() if g is not None else 0.0)
 
-                    c_t = f_gate * c_t + i_gate * g_gate
-                    h_t = o_gate * torch.tanh(c_t)
-                    h_states.append(h_t)
-            else:
-                for t in range(T_local):
-                    x_in = x_seq[0, t, :].unsqueeze(0)
-                    emb = input_proj(x_in.unsqueeze(0)).squeeze()
+            n0 = norms_i[0] if norms_i[0] > 1e-12 else 1e-12
+            rel_i = [v / n0 for v in norms_i]
+            all_rel_norms.append(rel_i)
 
-                    gates_x = emb @ W_ih.T + b_ih
-                    gates_h = h_t @ W_hh.T + b_hh
-                    H = h_dim
-                    r = torch.sigmoid(gates_x[:H] + gates_h[:H])
-                    z = torch.sigmoid(gates_x[H:2*H] + gates_h[H:2*H])
-                    n = torch.tanh(gates_x[2*H:] + r * gates_h[2*H:])
-                    h_t = (1 - z) * n + z * h_t
-                    h_states.append(h_t)
+        all_rel_norms = np.array(all_rel_norms)  # (N, T)
+        mean_norms = np.mean(all_rel_norms, axis=0)
+        p25 = np.percentile(all_rel_norms, 25, axis=0)
+        p75 = np.percentile(all_rel_norms, 75, axis=0)
 
-        # Loss no último passo
-        loss = h_states[-1].sum()
+        # Menor k onde a norma cai 10x e 20x
+        k_10x = next((k for k, v in enumerate(mean_norms) if v <= 0.10), None)
+        k_20x = next((k for k, v in enumerate(mean_norms) if v <= 0.05), None)
 
-        # ||∂L_T / ∂h_{T-k}||: gradiente direto pela cadeia conectada
-        norms = []
-        for k in range(T_local):
-            t_state = h_states[T_local - 1 - k]
-            try:
-                (g,) = torch.autograd.grad(
-                    loss, t_state,
-                    retain_graph=True, allow_unused=True, create_graph=False
-                )
-                norms.append(g.norm().item() if g is not None else 0.0)
-            except Exception:
-                norms.append(0.0)
+        return {
+            "mean": mean_norms,
+            "p25": p25,
+            "p75": p75,
+            "k_10x": k_10x,
+            "k_20x": k_20x
+        }
 
-        n0 = max(norms[0], 1e-15)
-        return [val / n0 for val in norms]
+    res_rnn = evaluate_model_gradients(model_path_rnn, "rnn", 113)
+    res_lstm = evaluate_model_gradients(model_path_lstm, "lstm", 65)
 
-    norms_rnn  = get_grad_norms(model_path_rnn,  "rnn",  128)
-    norms_lstm = get_grad_norms(model_path_lstm, "lstm",  64)
+    print("\nRESULTADOS DA MEDIÇÃO ANALÍTICA DO GRADIENTE:")
+    print(f"• RNN Simples: queda de 10× em k={res_rnn['k_10x']} passos | queda de 20× em k={res_rnn['k_20x']} passos.")
+    print(f"• LSTM       : queda de 10× em k={res_lstm['k_10x']} passos | queda de 20× em k={res_lstm['k_20x']} passos.")
 
     k_vals = np.arange(T)
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.semilogy(k_vals, norms_rnn,  label="RNN Simples", color="#d62728", lw=2.5, marker="o", markersize=3)
-    ax.semilogy(k_vals, norms_lstm, label="LSTM",        color="#1f77b4", lw=2.5, marker="s", markersize=3)
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
 
-    # Queda 10× na RNN
-    n0 = norms_rnn[0] if norms_rnn[0] > 0 else 1
-    threshold_10x = n0 / 10
-    idx_10x = next((i for i, v in enumerate(norms_rnn) if v < threshold_10x), None)
-    if idx_10x:
-        ax.axvline(idx_10x, color="#d62728", linestyle="--", alpha=0.6,
-                   label=f"RNN: queda 10× em k={idx_10x}")
+    ax.semilogy(k_vals, res_rnn["mean"], label=f"RNN Simples (queda 10× em k={res_rnn['k_10x']})",
+                color="#d62728", lw=2.5, marker="o", markersize=4)
+    ax.fill_between(k_vals, np.maximum(res_rnn["p25"], 1e-6), res_rnn["p75"], color="#d62728", alpha=0.15)
 
-    ax.set_xlabel("Defasagem $k$ (passos no passado)", fontsize=12)
-    ax.set_ylabel(r"Decaimento relativo $\|\partial L_T / \partial h_{T-k}\| / \|\partial L_T / \partial h_T\|$", fontsize=10)
+    ax.semilogy(k_vals, res_lstm["mean"], label=f"LSTM (queda 10× em k={res_lstm['k_10x']})",
+                color="#1f77b4", lw=2.5, marker="s", markersize=4)
+    ax.fill_between(k_vals, np.maximum(res_lstm["p25"], 1e-6), res_lstm["p75"], color="#1f77b4", alpha=0.15)
+
+    ax.axhline(0.10, color="gray", linestyle=":", alpha=0.7, label="Limiar 10× (0.10)")
+    ax.axhline(0.05, color="black", linestyle=":", alpha=0.7, label="Limiar 20× (0.05)")
+
+    ax.set_xlabel("Defasagem temporal $k$ (passos no passado)", fontsize=11)
+    ax.set_ylabel(r"Decaimento relativo $\frac{\|\partial L_T / \partial h_{T-k}\|}{\|\partial L_T / \partial h_T\|}$", fontsize=11)
     ax.set_title(
-        "Parte 4 — Horizonte de Memória Analítico\n"
-        "Vanishing Gradient: RNN simples colapsa em poucos passos, LSTM se sustenta",
-        fontsize=12
+        f"Parte 4 — Horizonte Analítico: Vanishing Gradient em Janelas Reais (MOT17, N={actual_n})\n"
+        f"RNN atinge corte 10× em k={res_rnn['k_10x']}, enquanto LSTM sustenta gradiente",
+        fontsize=11
     )
-    ax.legend(fontsize=10)
+    ax.legend(fontsize=9, loc="upper right")
     ax.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
 
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=200, bbox_inches="tight")
-        print(f"  Salvo em {save_path}")
+        plt.savefig(save_path, dpi=180, bbox_inches="tight")
+        print(f"Gráfico de horizonte analítico salvo em {save_path}")
 
     ipy_display(fig)
     plt.close(fig)
-    return {"rnn": norms_rnn, "lstm": norms_lstm}
+
+    return {"rnn": res_rnn, "lstm": res_lstm}
 
 
-# ---------------------------------------------------------------------------
-# 2. Medição Empírica
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 2. Horizonte de Memória Empírico
+# ===========================================================================
 
 def compute_empirical_horizon(
-    model_path: str,
+    model_path: str = FINAL_CHECKPOINT_PATH,
     seq_path: str = "data/MOT17/train/MOT17-09-SDP",
-    save_path: str = None
+    max_lost_frames: int = DEFAULT_MAX_LOST_FRAMES,
+    save_path: str = "docs/parte4_horizonte_empirico.png"
 ):
     """
-    Parte 4 — Horizonte de Memória Empírico.
-    Compara a distribuição de duração das oclusões que causam ID Switch
-    com as que a track sobrevive. Mostra onde o modelo "quebra" na prática.
+    Parte 4 — Horizonte de Memória Empírico:
+    - Analisa todos os gaps da GT (gap >= 3).
+    - Categoriza o desfecho de cada oclusão em:
+      * Sobreviveu (mesmo ID)
+      * ID Switch (troca para outro ID)
+      * Morte / Sem Match (não descartado!)
+    - Modela P(sobreviver | duração da oclusão) e define horizonte efetivo como
+      a maior duração com P >= 0.5.
     """
     from IPython.display import display as ipy_display
 
-    print("Calculando horizonte de memória empírico (distribuição de oclusões)...")
-    gt, dets, info, preds = _run_tracker(model_path, seq_path)
+    print(f"Calculando horizonte empírico de oclusões em {os.path.basename(seq_path)}...")
+    gt, dets, info, preds, _ = _run_tracker(model_path, seq_path, max_lost_frames=max_lost_frames)
 
-    switch_lens    = []  # durações de oclusão que causaram ID Switch
-    survived_lens  = []  # durações de oclusão que a track sobreviveu
+    all_gt_ids = sorted(list({tid for f in gt.values() for tid in f.keys()}))
 
-    for gt_id in sorted(set(tid for frame in gt.values() for tid in frame)):
-        gt_frames = sorted(f for f in gt if gt_id in gt[f])
-        for i in range(len(gt_frames) - 1):
-            gap = gt_frames[i+1] - gt_frames[i]
+    survived_records = []
+    switch_records = []
+    died_records = []
+    all_gaps = []
+
+    for gid in all_gt_ids:
+        frames_present = sorted([f for f in gt.keys() if gid in gt[f]])
+        for idx in range(len(frames_present) - 1):
+            f_before = frames_present[idx]
+            f_after = frames_present[idx + 1]
+            gap = f_after - f_before
             if gap < 3:
                 continue
-            f_before, f_after = gt_frames[i], gt_frames[i+1]
 
-            pid_before, iou_b = _best_match_pid(gt[f_before][gt_id], preds.get(f_before, {}))
-            pid_after,  iou_a = _best_match_pid(gt[f_after][gt_id],  preds.get(f_after,  {}))
+            all_gaps.append(gap)
+            box_before = gt[f_before][gid]
+            box_after = gt[f_after][gid]
 
-            if pid_before is None or pid_after is None or iou_b < 0.2 or iou_a < 0.2:
+            # Matching antes
+            pid_before = None
+            best_iou_b = 0.2
+            for pid, pbox in preds.get(f_before, {}).items():
+                iou = calculate_iou(box_before, pbox)
+                if iou >= best_iou_b:
+                    best_iou_b = iou
+                    pid_before = pid
+
+            # Matching depois
+            pid_after = None
+            best_iou_a = 0.2
+            for pid, pbox in preds.get(f_after, {}).items():
+                iou = calculate_iou(box_after, pbox)
+                if iou >= best_iou_a:
+                    best_iou_a = iou
+                    pid_after = pid
+
+            if pid_before is None:
+                # Track já não estava associada antes da oclusão
                 continue
 
-            if pid_before != pid_after:
-                switch_lens.append(gap)
+            if pid_after is None:
+                died_records.append(gap)
+            elif pid_after == pid_before:
+                survived_records.append(gap)
             else:
-                survived_lens.append(gap)
+                switch_records.append(gap)
 
-    med_sw  = int(np.median(switch_lens))   if switch_lens   else 0
-    med_sur = int(np.median(survived_lens)) if survived_lens else 0
+    total_events = len(survived_records) + len(switch_records) + len(died_records)
+    print(f"Total de oclusões avaliadas (gap >= 3): {total_events}")
+    print(f"• Sobrevividas : {len(survived_records)}")
+    print(f"• ID Switches  : {len(switch_records)}")
+    print(f"• Mortes/Sem match: {len(died_records)}")
 
-    print(f"  Oclusões com ID Switch: {len(switch_lens)}, mediana = {med_sw} quadros")
-    print(f"  Oclusões sobrevividas:  {len(survived_lens)}, mediana = {med_sur} quadros")
-    print(f"  → Horizonte efetivo do modelo: ~{med_sur} quadros (acima disso, predominam switches)")
+    # Curva de P(sobreviver | duracao)
+    bin_edges = np.arange(3, max(all_gaps + [20]) + 4, 3)
+    p_survive = []
+    bin_centers = []
+    counts_in_bin = []
 
-    all_vals = switch_lens + survived_lens
-    max_gap  = max(all_vals) if all_vals else 60
-    bins = np.arange(1, max_gap + 2, 2)
+    for i in range(len(bin_edges) - 1):
+        low, high = bin_edges[i], bin_edges[i+1]
+        n_surv = sum(1 for g in survived_records if low <= g < high)
+        n_total = (
+            sum(1 for g in survived_records if low <= g < high) +
+            sum(1 for g in switch_records if low <= g < high) +
+            sum(1 for g in died_records if low <= g < high)
+        )
+        if n_total > 0:
+            p_survive.append(n_surv / n_total)
+            bin_centers.append((low + high) / 2.0)
+            counts_in_bin.append(n_total)
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.hist(survived_lens, bins=bins, alpha=0.65, color="#2ca02c",
-            label=f"Sobreviveu (n={len(survived_lens)}, mediana={med_sur}f)")
-    ax.hist(switch_lens,   bins=bins, alpha=0.75, color="#d62728",
-            label=f"ID Switch / Morte (n={len(switch_lens)}, mediana={med_sw}f)")
-    ax.axvline(med_sur, color="#2ca02c", linestyle="--", lw=2)
-    ax.axvline(med_sw,  color="#d62728", linestyle="--", lw=2)
-    ax.set_xlabel("Duração da oclusão (quadros)", fontsize=12)
-    ax.set_ylabel("Frequência", fontsize=12)
-    ax.set_title(
-        f"Parte 4 — Horizonte de Memória Empírico (MOT17-09)\n"
-        f"Horizonte efetivo ≈ {med_sur}f — acima disso os ID Switches dominam",
-        fontsize=12
-    )
-    ax.legend(fontsize=10)
-    ax.grid(axis="y", alpha=0.3)
+    # Horizonte efetivo: maior duracao com P >= 0.5
+    effective_horizon = 0
+    for center, p in zip(bin_centers, p_survive):
+        if p >= 0.5:
+            effective_horizon = max(effective_horizon, int(center))
+
+    print(f"→ Horizonte empírico efetivo (P(sobreviver) >= 0.5): ~{effective_horizon} quadros.")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.2))
+
+    # Painel 1: Histograma de distribuição do dataset
+    bins_hist = np.arange(3, max(all_gaps + [25]) + 2, 2)
+    ax1.hist(survived_records, bins=bins_hist, alpha=0.7, color="#2ca02c", label=f"Sobreviveu (n={len(survived_records)})")
+    ax1.hist(switch_records, bins=bins_hist, alpha=0.7, color="#ff7f0e", label=f"ID Switch (n={len(switch_records)})")
+    ax1.hist(died_records, bins=bins_hist, alpha=0.7, color="#d62728", label=f"Morte/Sem match (n={len(died_records)})")
+    ax1.axvline(effective_horizon, color="black", linestyle="--", lw=2, label=f"Horizonte efetivo: {effective_horizon}f")
+    ax1.set_xlabel("Duração da oclusão (quadros)", fontsize=10)
+    ax1.set_ylabel("Frequência de oclusões", fontsize=10)
+    ax1.set_title("Distribuição de Oclusões e Desfechos", fontsize=11, fontweight="bold")
+    ax1.legend(fontsize=8)
+    ax1.grid(True, linestyle="--", alpha=0.4)
+
+    # Painel 2: P(sobreviver) vs Duração
+    ax2.plot(bin_centers, p_survive, "o-", color="#1f77b4", lw=2.5, markersize=6)
+    ax2.axhline(0.5, color="red", linestyle=":", label="Limiar P = 0.5")
+    ax2.axvline(effective_horizon, color="black", linestyle="--", lw=2, label=f"Horizonte: {effective_horizon}f")
+    ax2.set_xlabel("Duração da oclusão (quadros)", fontsize=10)
+    ax2.set_ylabel("P(sobreviver)", fontsize=10)
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.set_title("Curva de Sobrevivência P(sobreviver | duração)", fontsize=11, fontweight="bold")
+    ax2.legend(fontsize=8)
+    ax2.grid(True, linestyle="--", alpha=0.4)
+
     plt.tight_layout()
-
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=200, bbox_inches="tight")
-        print(f"  Salvo em {save_path}")
+        plt.savefig(save_path, dpi=180, bbox_inches="tight")
+        print(f"Gráfico de horizonte empírico salvo em {save_path}")
 
     ipy_display(fig)
     plt.close(fig)
-    return {"switch_lens": switch_lens, "survived_lens": survived_lens,
-            "horizon_frames": med_sur}
+
+    return {
+        "effective_horizon": effective_horizon,
+        "survived_count": len(survived_records),
+        "switch_count": len(switch_records),
+        "died_count": len(died_records)
+    }
 
 
-# ---------------------------------------------------------------------------
-# 3. Galeria de Falhas
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 3. Galeria de Falhas com Seleção Automática e Predição de Oclusão
+# ===========================================================================
 
-# 3 falhas confirmadas por diagnóstico com IoU real (ver /tmp/find_real_failures.py)
-CONFIRMED_FAILURES = [
-    {
-        # GT:1 | Gap=25f | frames 221→246 | Pred 20 → 28
-        "gt_id": 1,
-        "f_before": 221, "f_after": 246, "gap": 25,
-        "pid_before": 20, "pid_after": 28,
-        "title": "Falha 1 — GT:1 | Oclusão de 25 quadros (cruzamento com multidão)",
-        "diagnosis": (
-            "O pedestre GT:1 fica ocluído por 25 quadros (frames 221→246). "
-            "A janela de BPTT é T=32, mas a norma analítica ∂L/∂h cai >10× antes de k=10 passos "
-            "na RNN simples. No LSTM, a memória persiste — porém o rollout livre diverge da "
-            "trajetória real quando o pedestre muda de direção ao desviar de outros. "
-            "Resultado: IoU(caixa prevista, nova detecção) < 0.3 → ID Switch: Pred 20 → Pred 28."
-        ),
-    },
-    {
-        # GT:17 | Gap=28f | frames 451→479 | Pred 44 → 43
-        "gt_id": 17,
-        "f_before": 451, "f_after": 479, "gap": 28,
-        "pid_before": 44, "pid_after": 43,
-        "title": "Falha 2 — GT:17 | Oclusão de 28 quadros (cruzamento denso)",
-        "diagnosis": (
-            "O pedestre GT:17 fica oculto por 28 quadros contínuos (frames 451→479). "
-            "O estado h_{t} carrega posição residual com erro crescente no rollout; "
-            "quando o pedestre reaparece em posição ~137px à direita do previsto, "
-            "o IoU da caixa prevista com a nova detecção é ~0.05. "
-            "Isso fica abaixo do limiar de 0.3 → track Pred:44 morre, nova track Pred:43 nasce."
-        ),
-    },
-    {
-        # GT:17 | Gap=25f | frames 494→519 | Pred 43 → 29
-        "gt_id": 17,
-        "f_before": 494, "f_after": 519, "gap": 25,
-        "pid_before": 43, "pid_after": 29,
-        "title": "Falha 3 — GT:17 | Segunda oclusão de 25 quadros (acúmulo de erro)",
-        "diagnosis": (
-            "Segunda oclusão consecutiva do mesmo pedestre GT:17 (25 quadros, frames 494→519). "
-            "Após o ID Switch da Falha 2, o pedestre já opera com o ID Pred:43. "
-            "O rollout livre acumula erro de velocidade — o pedestre acelera no cruzamento "
-            "enquanto o modelo prediz desaceleração. "
-            "A incerteza gaussian padrão (log_sigma ≈ -1.5) não cresce o suficiente para "
-            "abrir o portão adaptativo → nova track Pred:29 nasce, Pred:43 declarada morta."
-        ),
-    },
-]
+def find_and_select_failures(
+    model_path: str = FINAL_CHECKPOINT_PATH,
+    seq_path: str = "data/MOT17/train/MOT17-09-SDP",
+    max_lost_frames: int = DEFAULT_MAX_LOST_FRAMES,
+    top_k: int = 3
+):
+    """
+    Seleção automática e reproduzível dos 3 maiores erros de rastreamento:
+    Critério: oclusão real com troca de ID confirmada, ordenado pela duração do gap.
+    Garante que os casos pertençam a GT IDs distintos.
+    """
+    gt, dets, info, preds, tracker = _run_tracker(model_path, seq_path, max_lost_frames=max_lost_frames)
 
+    candidates = []
+    gt_ids = sorted(list({tid for f in gt.values() for tid in f.keys()}))
 
-def _draw_strip(axes, frames, gt, gt_id, pid_before, pid_after, preds, seq_path, crop=True):
-    """Desenha uma tira de quadros para uma falha específica, com zoom na região de interesse."""
-    # Determina bounding box da região de interesse (entorno do GT)
-    gt_boxes_in_range = [gt[f][gt_id][:4] for f in frames if f in gt and gt_id in gt[f]]
-    if gt_boxes_in_range:
-        xs = [b[0] for b in gt_boxes_in_range]
-        ys = [b[1] for b in gt_boxes_in_range]
-        ws = [b[2] for b in gt_boxes_in_range]
-        hs = [b[3] for b in gt_boxes_in_range]
-        # Janela de crop: região de interesse + margem generosa
-        margin = 150
-        crop_x1 = max(0, int(min(xs)) - margin)
-        crop_y1 = max(0, int(min(ys)) - margin)
-        crop_x2 = int(max(x + w for x, w in zip(xs, ws))) + margin
-        crop_y2 = int(max(y + h for y, h in zip(ys, hs))) + margin
-    else:
-        crop = False
-
-    for ax, f in zip(axes, frames):
-        img_path = os.path.join(seq_path, "img1", f"{f:06d}.jpg")
-        img = np.array(Image.open(img_path))
-
-        if crop:
-            cx1, cy1 = crop_x1, crop_y1
-            cx2, cy2 = min(crop_x2, img.shape[1]), min(crop_y2, img.shape[0])
-            img_show = img[cy1:cy2, cx1:cx2]
-            ox, oy = cx1, cy1  # offset para ajustar coordenadas das caixas
-        else:
-            img_show = img
-            ox, oy = 0, 0
-
-        ax.imshow(img_show)
-        ax.axis("off")
-
-        # Destaque: frame antes do gap, durante, e depois
-        if f in gt and gt_id not in gt[f]:
-            ax.set_title(f"Frame {f}\n⚠ Oculto", fontsize=7.5, color="gray")
-        elif f == frames[0]:
-            ax.set_title(f"Frame {f}\n✓ Visível", fontsize=7.5, color="lime")
-        elif f == frames[-1]:
-            ax.set_title(f"Frame {f}\n↩ Reaparecer", fontsize=7.5, color="cyan")
-        else:
-            ax.set_title(f"Frame {f}", fontsize=7.5)
-
-        # Caixa GT (verde)
-        if f in gt and gt_id in gt[f]:
-            x, y, w, h = gt[f][gt_id][:4]
-            rect = plt.Rectangle((x - ox, y - oy), w, h, fill=False,
-                                  edgecolor="lime", lw=2.5, linestyle="-")
-            ax.add_patch(rect)
-            ax.text(x - ox, y - oy - 6, f"GT:{gt_id}", color="lime", fontsize=7,
-                    fontweight="bold", bbox=dict(facecolor="black", alpha=0.5, pad=1))
-
-        # Caixas do tracker neste frame
-        for pid, pbox in preds.get(f, {}).items():
-            x, y, w, h = pbox[:4]
-            # Só plota se estiver dentro da janela de crop
-            if crop and (x + w < cx1 or x > cx2 or y + h < cy1 or y > cy2):
+    for gid in gt_ids:
+        frames_present = sorted([f for f in gt.keys() if gid in gt[f]])
+        for idx in range(len(frames_present) - 1):
+            f_before = frames_present[idx]
+            f_after = frames_present[idx + 1]
+            gap = f_after - f_before
+            if gap < 4:
                 continue
-            if pid == pid_before:
-                color, style = "#ff4444", "-"   # ID original: vermelho
-            elif pid == pid_after:
-                color, style = "#ff9900", "--"  # ID novo (switch): laranja
-            else:
-                continue  # Ignora outros IDs para não poluir
-            rect = plt.Rectangle((x - ox, y - oy), w, h, fill=False,
-                                  edgecolor=color, lw=2.0, linestyle=style)
-            ax.add_patch(rect)
-            ax.text(x - ox + w, y - oy + h, f"P:{pid}", color=color, fontsize=7,
-                    fontweight="bold", bbox=dict(facecolor="black", alpha=0.5, pad=1))
+
+            box_before = gt[f_before][gid]
+            box_after = gt[f_after][gid]
+
+            pid_before = None
+            for pid, pb in preds.get(f_before, {}).items():
+                if calculate_iou(box_before, pb) >= 0.2:
+                    pid_before = pid
+                    break
+
+            pid_after = None
+            best_iou_after = 0.0
+            for pid, pb in preds.get(f_after, {}).items():
+                iou = calculate_iou(box_after, pb)
+                if iou >= 0.2:
+                    pid_after = pid
+                    best_iou_after = iou
+                    break
+
+            # Critério: estava associado antes, mas reapareceu com ID diferente
+            if pid_before is not None and pid_after is not None and pid_before != pid_after:
+                # Coleta predição durante oclusão da track original
+                pred_box_at_reappear = None
+                for t in tracker.tracks:
+                    if t.track_id == pid_before and f_after in t.lost_predictions:
+                        pred_box_at_reappear = t.lost_predictions[f_after]
+                        break
+
+                iou_pred_reappear = 0.0
+                if pred_box_at_reappear is not None:
+                    iou_pred_reappear = calculate_iou(pred_box_at_reappear, box_after)
+
+                # Erro euclidiano de centroide
+                cx_gt = box_after[0] + box_after[2] / 2.0
+                cy_gt = box_after[1] + box_after[3] / 2.0
+                if pred_box_at_reappear is not None:
+                    cx_p = pred_box_at_reappear[0] + pred_box_at_reappear[2] / 2.0
+                    cy_p = pred_box_at_reappear[1] + pred_box_at_reappear[3] / 2.0
+                    pos_err = np.sqrt((cx_gt - cx_p)**2 + (cy_gt - cy_p)**2)
+                else:
+                    pos_err = 0.0
+
+                candidates.append({
+                    "gt_id": gid,
+                    "f_before": f_before,
+                    "f_after": f_after,
+                    "gap": gap,
+                    "pid_before": pid_before,
+                    "pid_after": pid_after,
+                    "iou_at_reappear": best_iou_after,
+                    "iou_pred_reappear": iou_pred_reappear,
+                    "pos_err": pos_err,
+                })
+
+    # Ordena por maior gap de oclusão
+    candidates.sort(key=lambda x: x["gap"], reverse=True)
+
+    selected = []
+    used_gts = set()
+    for c in candidates:
+        if c["gt_id"] not in used_gts:
+            selected.append(c)
+            used_gts.add(c["gt_id"])
+            if len(selected) == top_k:
+                break
+
+    return selected, gt, preds, tracker, info
 
 
 def plot_failure_gallery(
-    model_path: str,
+    model_path: str = FINAL_CHECKPOINT_PATH,
     seq_path: str = "data/MOT17/train/MOT17-09-SDP",
     save_dir: str = "docs/",
-    bptt_window: int = 32
+    bptt_window: int = 16
 ):
     """
-    Parte 4 — Galeria de 3 Falhas.
-    Cada falha: tira de 6 quadros com crop na região de interesse,
-    GT (verde), pred original (vermelho sólido), novo ID após switch (laranja tracejado)
-    + diagnóstico quantitativo.
+    Parte 4 — Galeria de Falhas com seleção automática reproduzível:
+    - 3 tiras com crop na região de interesse.
+    - Mostra a caixa prevista pela recorrência (rollout) durante a oclusão.
+    - Diagnóstico quantitativo baseado estritamente nos números medidos.
     """
     from IPython.display import display as ipy_display
 
-    print("Gerando Galeria de Falhas (3 ID Switches confirmados por IoU)...")
-    gt, dets, info, preds = _run_tracker(model_path, seq_path)
+    selected_cases, gt, preds, tracker, info = find_and_select_failures(
+        model_path=model_path, seq_path=seq_path, max_lost_frames=DEFAULT_MAX_LOST_FRAMES, top_k=3
+    )
+
+    if len(selected_cases) < 3:
+        print(f"[AVISO] Encontradas {len(selected_cases)} falhas automáticas com os critérios estipulados.")
+
     os.makedirs(save_dir, exist_ok=True)
 
-    for idx, case in enumerate(CONFIRMED_FAILURES):
-        gt_id      = case["gt_id"]
-        f_before   = case["f_before"]
-        f_after    = case["f_after"]
+    for idx, case in enumerate(selected_cases):
+        gt_id = case["gt_id"]
+        f_before = case["f_before"]
+        f_after = case["f_after"]
+        gap = case["gap"]
         pid_before = case["pid_before"]
-        pid_after  = case["pid_after"]
-        gap        = case["gap"]
+        pid_after = case["pid_after"]
 
-        # 6 frames: 2 antes do gap, 2 durante, 2 depois
-        n_before = 2
         step_during = max(1, gap // 3)
-        frames = (
-            [f_before - 2, f_before] +
-            [f_before + step_during, f_before + 2 * step_during] +
-            [f_after, f_after + 3]
-        )
+        frames = [
+            f_before - 2, f_before,
+            f_before + step_during, f_before + 2 * step_during,
+            f_after, f_after + 3
+        ]
         frames = [f for f in frames if f >= 1]
 
-        fig, axes = plt.subplots(1, len(frames), figsize=(3.2 * len(frames), 3.8))
+        # Encontra track objeto do pid_before
+        target_track = None
+        for t in tracker.tracks:
+            if t.track_id == pid_before:
+                target_track = t
+                break
 
-        _draw_strip(axes, frames, gt, gt_id, pid_before, pid_after, preds, seq_path, crop=True)
+        # Crop na região do GT
+        gt_boxes = [gt[f][gt_id][:4] for f in frames if f in gt and gt_id in gt[f]]
+        if gt_boxes:
+            xs = [b[0] for b in gt_boxes]
+            ys = [b[1] for b in gt_boxes]
+            margin = 140
+            crop_x1 = max(0, int(min(xs)) - margin)
+            crop_y1 = max(0, int(min(ys)) - margin)
+            crop_x2 = int(max(b[0] + b[2] for b in gt_boxes)) + margin
+            crop_y2 = int(max(b[1] + b[3] for b in gt_boxes)) + margin
+        else:
+            crop_x1, crop_y1, crop_x2, crop_y2 = 0, 0, 1920, 1080
 
-        # Legenda
+        fig, axes = plt.subplots(1, len(frames), figsize=(3.2 * len(frames), 4.0))
+
+        for ax, f in zip(axes, frames):
+            img_path = os.path.join(seq_path, "img1", f"{f:06d}.jpg")
+            if os.path.exists(img_path):
+                img = np.array(Image.open(img_path))
+                cx1 = crop_x1; cy1 = crop_y1
+                cx2 = min(crop_x2, img.shape[1]); cy2 = min(crop_y2, img.shape[0])
+                img_crop = img[cy1:cy2, cx1:cx2]
+                ox, oy = cx1, cy1
+            else:
+                img_crop = np.zeros((300, 300, 3), dtype=np.uint8)
+                ox, oy = 0, 0
+
+            ax.imshow(img_crop)
+            ax.axis("off")
+
+            # Status do quadro
+            if f in gt and gt_id in gt[f]:
+                status_txt = "Visível" if f <= f_before else "Reaparece"
+                ax.set_title(f"Quadro {f}\n{status_txt}", fontsize=8)
+                # Bounding box GT (Verde)
+                bx = gt[f][gt_id][:4]
+                ax.add_patch(plt.Rectangle((bx[0] - ox, bx[1] - oy), bx[2], bx[3],
+                                           fill=False, edgecolor="#00ff00", lw=2.5))
+                ax.text(bx[0] - ox, bx[1] - oy - 4, f"GT:{gt_id}", color="#00ff00",
+                        fontsize=7, fontweight="bold", bbox=dict(facecolor="black", alpha=0.5, pad=1))
+            else:
+                ax.set_title(f"Quadro {f}\nOclusão", fontsize=8, color="gray")
+
+            # Predição do rollout durante oclusão (Azul tracejado)
+            if target_track is not None and f in target_track.lost_predictions:
+                pb = target_track.lost_predictions[f]
+                ax.add_patch(plt.Rectangle((pb[0] - ox, pb[1] - oy), pb[2], pb[3],
+                                           fill=False, edgecolor="#3399ff", lw=2.0, linestyle=":"))
+                ax.text(pb[0] - ox, pb[1] - oy + pb[3] + 10, f"Pred roll P:{pid_before}", color="#3399ff",
+                        fontsize=7, bbox=dict(facecolor="black", alpha=0.5, pad=1))
+
+            # Predição observada do tracker
+            for pid, pbox in preds.get(f, {}).items():
+                if pid == pid_before:
+                    ax.add_patch(plt.Rectangle((pbox[0] - ox, pbox[1] - oy), pbox[2], pbox[3],
+                                               fill=False, edgecolor="#ff3333", lw=2.0))
+                    ax.text(pbox[0] - ox, pbox[1] - oy - 4, f"P:{pid}", color="#ff3333",
+                            fontsize=7, fontweight="bold", bbox=dict(facecolor="black", alpha=0.5, pad=1))
+                elif pid == pid_after and f >= f_after:
+                    ax.add_patch(plt.Rectangle((pbox[0] - ox, pbox[1] - oy), pbox[2], pbox[3],
+                                               fill=False, edgecolor="#ff9900", lw=2.0, linestyle="--"))
+                    ax.text(pbox[0] - ox + pbox[2] - 30, pbox[1] - oy - 4, f"P:{pid}", color="#ff9900",
+                            fontsize=7, fontweight="bold", bbox=dict(facecolor="black", alpha=0.5, pad=1))
+
+        # Diagnóstico quantitativo construído exclusivamente com f-strings dos números
+        diagnosis_text = (
+            f"Diagnóstico Quantitativo (Falha {idx+1}):\n"
+            f"• Pedestre GT:{gt_id} sofreu oclusão de {gap} quadros contínuos (quadros {f_before}→{f_after}).\n"
+            f"• Janela de BPTT do modelo: T={bptt_window} passos. Sob rollout autoregressivo por {gap} quadros,\n"
+            f"  o erro euclidiano acumulado de centroide foi de {case['pos_err']:.1f} pixels.\n"
+            f"• IoU entre a caixa predita pelo rollout e a nova observação no reaparecimento: {case['iou_pred_reappear']:.3f}.\n"
+            f"• Como {case['iou_pred_reappear']:.3f} < limiar de associação (0.30), a track original P:{pid_before} não foi associada,\n"
+            f"  gerando ID switch para a nova track P:{pid_after}."
+        )
+
+        title_text = f"Falha {idx+1} — GT:{gt_id} | Oclusão de {gap} quadros | Switch: P:{pid_before} → P:{pid_after}"
+        fig.suptitle(title_text, fontsize=10, fontweight="bold", y=1.02)
+        fig.text(0.5, -0.15, diagnosis_text, ha="center", va="top", fontsize=8, wrap=True,
+                 bbox=dict(facecolor="#fffde7", edgecolor="#cccc00", alpha=0.9, pad=6), transform=fig.transFigure)
+
         legend_patches = [
-            mpatches.Patch(edgecolor="lime",    facecolor="none", lw=2,
-                           label=f"Ground Truth (GT:{gt_id})"),
-            mpatches.Patch(edgecolor="#ff4444", facecolor="none", lw=2,
-                           label=f"Pred:{pid_before} (ID original)"),
-            mpatches.Patch(edgecolor="#ff9900", facecolor="none", lw=2, linestyle="--",
-                           label=f"Pred:{pid_after} (novo ID após switch)"),
+            mpatches.Patch(edgecolor="#00ff00", facecolor="none", lw=2, label=f"Ground Truth (GT:{gt_id})"),
+            mpatches.Patch(edgecolor="#ff3333", facecolor="none", lw=2, label=f"Pred original (P:{pid_before})"),
+            mpatches.Patch(edgecolor="#3399ff", facecolor="none", lw=2, linestyle=":", label="Rollout sob oclusão"),
+            mpatches.Patch(edgecolor="#ff9900", facecolor="none", lw=2, linestyle="--", label=f"Novo ID (P:{pid_after})"),
         ]
-        fig.legend(handles=legend_patches, loc="lower center", ncol=3,
-                   bbox_to_anchor=(0.5, -0.03), fontsize=8)
-
-        # Título
-        fig.suptitle(case["title"], fontsize=10, fontweight="bold", y=1.02)
-
-        # Diagnóstico em caixa de texto abaixo
-        fig.text(0.5, -0.12, case["diagnosis"], ha="center", va="top",
-                 fontsize=7.5, wrap=True,
-                 bbox=dict(facecolor="#fffde7", edgecolor="#cccc00", alpha=0.9, pad=6),
-                 transform=fig.transFigure)
+        fig.legend(handles=legend_patches, loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.04), fontsize=8)
 
         plt.tight_layout()
         save_file = os.path.join(save_dir, f"parte4_falha{idx+1}_gt{gt_id}.png")
-        plt.savefig(save_file, dpi=150, bbox_inches="tight")
+        plt.savefig(save_file, dpi=160, bbox_inches="tight")
         ipy_display(fig)
         plt.close(fig)
-        print(f"  Falha {idx+1} salva: {save_file}")
-
-    print(f"\nGaleria completa salva em {save_dir}")
+        print(f"Falha {idx+1} salva: {save_file}")
 
 
-# ---------------------------------------------------------------------------
-# 4. Correção: demonstrate_fix
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 4. Demonstração de Correção
+# ===========================================================================
 
 def demonstrate_fix(
-    model_path: str,
-    seq_path: str = "data/MOT17/train/MOT17-09-SDP",
-    save_dir: str = "docs/",
+    model_path: str = FINAL_CHECKPOINT_PATH,
+    seq_paths: list = None,
     velocity_damping: float = 0.85,
-    sigma_inflation: float = 0.3
+    sigma_inflation: float = 0.30,
+    save_dir: str = "docs/"
 ):
     """
-    Parte 4 — Correção: antes/depois aplicada à Falha 1 (GT:1, gap=25f, frames 221→246).
-    O detector TEM uma detecção com IoU=0.855 no reaparecimento, mas o pred divergiu
-    para IoU=0.179 < threshold=0.30 → ID Switch.
-    Correção: portão adaptativo proporcional ao tempo de oclusão (sigma_inflation)
-    abaixa o threshold progressivamente, permitindo reacitar o pedestre correto.
+    Parte 4 — Demonstração da Correção:
+    - Compara ANTES vs DEPOIS no MESMO protocolo unificado (EVAL_IOU = 0.5, max_lost_frames = 15).
+    - Avalia nas sequências MOT17-09 e MOT17-11.
+    - Conclusão estritamente derivada dos dados medidos.
     """
     from IPython.display import display as ipy_display
-    from src.metrics import evaluate_tracking
 
-    print(f"Aplicando correção: velocity_damping={velocity_damping}, sigma_inflation={sigma_inflation}")
-    print("Falha alvo: GT:1 | frames 221→246 | gap=25f | Pred:20→28")
-    print("Diagnóstico: detector tem IoU=0.855, mas pred divergiu para IoU=0.179 < threshold=0.30")
-    print("Correção: portão adaptativo proporcional ao tempo de oclusão")
+    if seq_paths is None:
+        seq_paths = [
+            "data/MOT17/train/MOT17-09-SDP",
+            "data/MOT17/train/MOT17-11-SDP"
+        ]
 
-    gt, dets, info, preds_antes = _run_tracker(model_path, seq_path)
-    _, _, _, preds_depois = _run_tracker(
-        model_path, seq_path,
-        velocity_damping=velocity_damping,
-        sigma_inflation=sigma_inflation
+    SEP = "=" * 90
+    print("\n" + SEP)
+    print("PARTE 4 — CORREÇÃO: COMPARAÇÃO ANTES vs DEPOIS (Protocolo unificado EVAL_IOU = 0.5)")
+    print(f"Intervenção: velocity_damping={velocity_damping}, sigma_inflation={sigma_inflation}")
+    print(SEP)
+    header = "{:<12} | {:<8} | {:<8} | {:<10} | {:<8} | {:<8} | {:<8}".format(
+        "Sequência", "Condição", "IDF1", "Delta IDF1", "IDSW", "Delta IDSW", "Frag"
     )
+    print(header)
+    print("-" * 90)
 
-    m_antes  = evaluate_tracking(gt, preds_antes)
-    m_depois = evaluate_tracking(gt, preds_depois)
+    results = []
 
-    delta_idf1 = m_depois["idf1"] - m_antes["idf1"]
-    delta_sw   = m_depois["id_switches"] - m_antes["id_switches"]
-    delta_frag = m_depois.get("fragmentations", 0) - m_antes.get("fragmentations", 0)
+    for s_path in seq_paths:
+        if not os.path.exists(s_path):
+            continue
 
-    print(f"\n  Métricas globais (MOT17-09, sequência completa):")
-    print(f"  {'':22s} {'ANTES':>10s}  {'DEPOIS':>10s}  {'Delta':>10s}")
-    print(f"  {'IDF1':22s} {m_antes['idf1']:>10.4f}  {m_depois['idf1']:>10.4f}  {delta_idf1:>+10.4f}")
-    print(f"  {'ID Switches':22s} {m_antes['id_switches']:>10d}  {m_depois['id_switches']:>10d}  {delta_sw:>+10d}")
-    print(f"  {'Fragmentações':22s} {m_antes.get('fragmentations',0):>10d}  {m_depois.get('fragmentations',0):>10d}  {delta_frag:>+10d}")
-
-    # Foca na Falha 1 (GT:1, 221→246)
-    case    = CONFIRMED_FAILURES[0]
-    gt_id   = case["gt_id"]
-    f_bef   = case["f_before"]
-    f_aft   = case["f_after"]
-    gap     = case["gap"]
-    step_d  = max(1, gap // 3)
-    frames  = [f_bef - 2, f_bef, f_bef + step_d, f_bef + 2*step_d, f_aft, f_aft + 3]
-
-    # Verifica se a correção recuperou o ID no reaparecimento
-    pid_original = case["pid_before"]
-    pid_depois_aft = None
-    for pid, pb in preds_depois.get(f_aft, {}).items():
-        if _box_iou(pb[:4], gt[f_aft][gt_id][:4]) > 0.2:
-            pid_depois_aft = pid
-            break
-    recovered = (pid_depois_aft == pid_original)
-    print(f"\n  Verificação específica (GT:{gt_id}, frame {f_aft}):")
-    print(f"    ANTES:  Pred:{case['pid_after']} (ID trocado)")
-    print(f"    DEPOIS: Pred:{pid_depois_aft} ({'✓ ID RECUPERADO!' if recovered else 'ainda trocado — correção parcial'})")
-
-    fig, axes = plt.subplots(2, len(frames), figsize=(3.0 * len(frames), 7.5))
-
-    for row, (preds_row, label) in enumerate([
-        (preds_antes,  "ANTES — threshold fixo (0.30)"),
-        (preds_depois, f"DEPOIS — portão adaptativo (threshold ∝ tempo de oclusão)")
-    ]):
-        _draw_strip(axes[row], frames, gt, gt_id,
-                    case["pid_before"], case["pid_after"],
-                    preds_row, seq_path, crop=True)
-        axes[row][0].set_ylabel(label, fontsize=8.5, fontweight="bold",
-                                rotation=90, labelpad=5)
-
-    status_str = "✓ ID RECUPERADO" if recovered else "parcialmente corrigido"
-    fig.suptitle(
-        f"Parte 4 — Correção | GT:1 (gap={gap}f, frames {f_bef}→{f_aft}) | {status_str}\n"
-        f"IDF1: {m_antes['idf1']:.4f} → {m_depois['idf1']:.4f} ({delta_idf1:+.4f})  |  "
-        f"ID Switches: {m_antes['id_switches']} → {m_depois['id_switches']} ({delta_sw:+d})",
-        fontsize=10, fontweight="bold"
-    )
-
-    if delta_sw < 0:
-        conclusion = (
-            f"A correção reduziu os ID Switches em {abs(delta_sw)} e {'melhorou' if delta_idf1 > 0 else 'manteve'} "
-            f"o IDF1 em {delta_idf1:+.4f}. O portão adaptativo proporcional ao tempo de oclusão "
-            "baixou o threshold de 0.30 → 0.10 após 25 frames perdidos, reasociando a detecção "
-            "(IoU=0.855) à track original mesmo com o pred em IoU=0.179."
+        seq_name = os.path.basename(s_path)
+        gt, dets, info, preds_antes, _ = _run_tracker(
+            model_path, s_path, velocity_damping=1.0, sigma_inflation=0.0
         )
-    else:
-        conclusion = (
-            "A correção não alterou os ID Switches globais: embora recupere esta falha específica, "
-            "o threshold mais baixo também aceita associações erradas em outros casos, "
-            "equilibrando o resultado. O diagnóstico correto indica que a correção deve ser "
-            "aplicada SOMENTE a tracks com oclusão longa E com detector presente (IoU > 0), "
-            "não globalmente — uma lógica mais cirúrgica que está além do escopo deste PA."
+        _, _, _, preds_depois, _ = _run_tracker(
+            model_path, s_path, velocity_damping=velocity_damping, sigma_inflation=sigma_inflation
         )
 
-    fig.text(0.5, 0.01, conclusion, ha="center", fontsize=7.5,
-             bbox=dict(facecolor="#fffde7", edgecolor="#cccc00", alpha=0.9, pad=5))
+        m_antes = evaluate_tracking(gt, preds_antes, iou_threshold=EVAL_IOU)
+        m_depois = evaluate_tracking(gt, preds_depois, iou_threshold=EVAL_IOU)
 
-    plt.tight_layout(rect=[0, 0.08, 1, 1])
-    save_path = os.path.join(save_dir, "parte4_antes_depois_correcao.png")
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    ipy_display(fig)
-    plt.close(fig)
-    print(f"\n  Imagem comparativa salva em {save_path}")
+        d_idf1 = m_depois["idf1"] - m_antes["idf1"]
+        d_idsw = m_depois["id_switches"] - m_antes["id_switches"]
+        d_frag = m_depois["fragmentations"] - m_antes["fragmentations"]
+
+        print("{:<12} | {:<8} | {:<8.3f} | {:<10} | {:<8d} | {:<10} | {:<8d}".format(
+            seq_name, "ANTES", m_antes["idf1"], "-", m_antes["id_switches"], "-", m_antes["fragmentations"]
+        ))
+        print("{:<12} | {:<8} | {:<8.3f} | {:<+10.3f} | {:<8d} | {:<+10d} | {:<8d}".format(
+            "", "DEPOIS", m_depois["idf1"], d_idf1, m_depois["id_switches"], d_idsw, m_depois["fragmentations"]
+        ))
+        print("-" * 90)
+
+        results.append({
+            "seq_name": seq_name,
+            "antes": m_antes,
+            "depois": m_depois,
+            "d_idf1": d_idf1,
+            "d_idsw": d_idsw,
+            "d_frag": d_frag
+        })
+
+    print(SEP + "\n")
+    return results

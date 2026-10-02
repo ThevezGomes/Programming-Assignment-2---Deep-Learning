@@ -117,7 +117,7 @@ def plot_occlusion_strip(
             status = "VISÍVEL"
             status_color = "green"
         else:
-            status = "OCLUSÃO TOTAL\n(0 px visíveis)"
+            status = "OCLUSÃO (< 8% visível)"
             status_color = "red"
 
         ax.set_title(f"Quadro {f}\n{status}", fontsize=8, fontweight="bold", color=status_color)
@@ -276,9 +276,12 @@ def plot_decoupling_panel_two_rows(
     bar2 = ax_top.bar(x + w/2, idf1s, w, label="IDF1 (Consistência Temporal)", color="#d95f02", alpha=0.9)
     ax_top.set_ylabel("Score (0 a 1)", fontsize=11, fontweight="bold")
     ax_top.set_ylim(0, 1.08)
+    mean_map_val = float(np.mean(maps)) if len(maps) > 0 else 0.0
+    min_idf_val = float(min(idf1s)) if len(idf1s) > 0 else 0.0
+    max_idf_val = float(max(idf1s)) if len(idf1s) > 0 else 0.0
     ax_top.set_title(
         "PAINEL SUPERIOR: mAP por Quadro (Detecção) vs IDF1 (Rastreamento)\n"
-        "[O detector mantém mAP ~0.75-0.80 estável, mas o IDF1 colapsa com o aumento da densidade]",
+        f"[mAP médio: {mean_map_val:.2f} | IDF1 varia de {min_idf_val:.2f} a {max_idf_val:.2f} conforme densidade]",
         fontsize=11, fontweight="bold"
     )
     ax_top.legend(loc="upper right", fontsize=9)
@@ -296,9 +299,11 @@ def plot_decoupling_panel_two_rows(
     bar4 = ax_bot.bar(x + w/2, sw_per_gt, w, label="ID Switches por Identidade ($IDSW / N_{gt}$)", color="#e7298a", alpha=0.9)
     ax_bot.axhline(y=1.0, color="gray", linestyle=":", lw=1.5, label="Contagem Perfeita (1.0x)")
     ax_bot.set_ylabel("Múltiplos / Razão", fontsize=11, fontweight="bold")
+    mean_ratio_val = float(np.mean(ratios)) if len(ratios) > 0 else 0.0
+    max_ratio_val = float(max(ratios)) if len(ratios) > 0 else 0.0
     ax_bot.set_title(
         "PAINEL INFERIOR: Fragmentação de Trajetórias e Trocas de Identidade\n"
-        "[Em sequências densas, cada pedestre real é fragmentado em mais de 2.5 IDs diferentes]",
+        f"[Razão média de IDs: {mean_ratio_val:.2f}x (máximo de {max_ratio_val:.2f}x nas sequências mais densas)]",
         fontsize=11, fontweight="bold"
     )
     ax_bot.set_xticks(x)
@@ -547,11 +552,18 @@ def plot_ablation_eixo1(results_path: str = "results/ablation_eixo1.json", save_
         
     ax.set_xticks([4, 8, 16, 32])
     ax.set_xlabel("Comprimento da Janela de BPTT (T quadros)", fontsize=11, fontweight="bold")
-    ax.set_ylabel("Média do IDF1 (MOT17-09)", fontsize=11, fontweight="bold")
-    ax.set_title("Parte 3 (Eixo 1) — Ablação da Célula Recorrente e Janela de BPTT\n"
-                 "(RNN Simples colapsa em janelas longas por Vanishing Gradient)", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Média do IDF1", fontsize=11, fontweight="bold")
     
-    ax.legend(title="Arquitetura\n(~35k parâmetros)", framealpha=0.9)
+    # Subtítulo baseado na medição real
+    rnn_means = series.get("RNN", {}).get("mean", [])
+    lstm_means = series.get("LSTM", {}).get("mean", [])
+    if len(rnn_means) >= 3 and len(lstm_means) >= 3:
+        sub_txt = f"(Janela T=16: LSTM={lstm_means[2]:.3f} vs RNN={rnn_means[2]:.3f} | Delta: {lstm_means[2] - rnn_means[2]:+.3f})"
+    else:
+        sub_txt = "(Orçamento calibrado em ~40k parâmetros para todas as células)"
+    ax.set_title(f"Parte 3 (Eixo 1) — Ablação da Célula Recorrente e Janela de BPTT\n{sub_txt}", fontsize=12, fontweight="bold")
+    
+    ax.legend(title="Arquitetura\n(~40k parâmetros)", framealpha=0.9)
     ax.grid(axis="y", linestyle="--", alpha=0.6)
     
     plt.tight_layout()
@@ -575,7 +587,7 @@ def plot_stress_detector_results(results: list, seq_name: str = "MOT17-09", save
     3. Frequência de Erros Temporais: Barras comparativas de ID Switches por nível.
     """
     levels = [r["level"] for r in results]
-    map_vals = [r["map_score"] for r in results]
+    map_vals = [r.get("map_mean", r.get("map_score", 0.0)) for r in results]
     naive_idf1 = [r["naive"]["idf1"] for r in results]
     lstm_idf1 = [r["lstm"]["idf1"] for r in results]
     naive_idsw = [r["naive"]["id_switches"] for r in results]
@@ -583,10 +595,13 @@ def plot_stress_detector_results(results: list, seq_name: str = "MOT17-09", save
 
     x_idx = np.arange(len(levels))
 
+    delta_sev = lstm_idf1[-1] - naive_idf1[-1]
+    retencao_txt = "Absorção" if delta_sev >= 0.008 else ("Neutro" if abs(delta_sev) < 0.008 else "Amplificação")
+
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
     fig.suptitle(
         f"Parte 5 — Teste de Estresse da Qualidade do Detector ({seq_name})\n"
-        "O Modelo Temporal Recorrente (LSTM) Absorve Falhas do Detector e Sustenta a Identidade",
+        f"Comportamento do Modelo Recorrente sob Degradação (Veredito: {retencao_txt} | Delta Severo: {delta_sev:+.3f})",
         fontsize=12, fontweight="bold", y=1.03
     )
 
@@ -597,7 +612,7 @@ def plot_stress_detector_results(results: list, seq_name: str = "MOT17-09", save
     ax1 = axes[0]
     ax1.plot(x_idx, naive_idf1, marker="o", color=color_naive, lw=2.2, linestyle="--", label="Baseline (Naive Tracker)")
     ax1.plot(x_idx, lstm_idf1, marker="s", color=color_lstm, lw=2.4, label="Trilha A (LSTM Motion)")
-    ax1.fill_between(x_idx, naive_idf1, lstm_idf1, color=color_lstm, alpha=0.15, label="Margem de Absorção")
+    ax1.fill_between(x_idx, naive_idf1, lstm_idf1, color=color_lstm, alpha=0.15, label="Margem de Desempenho")
     ax1.set_xticks(x_idx)
     ax1.set_xticklabels(levels, fontweight="bold")
     ax1.set_xlabel("Intensidade de Degradação", fontsize=10, fontweight="bold")
@@ -606,10 +621,9 @@ def plot_stress_detector_results(results: list, seq_name: str = "MOT17-09", save
     ax1.grid(True, linestyle=":", alpha=0.6)
     ax1.legend(loc="lower left", fontsize=9)
 
-    # Anotação de ganho no nível severo
-    delta_sev = lstm_idf1[-1] - naive_idf1[-1]
+    # Anotação de ganho no nível severo derivado dos números
     ax1.annotate(
-        f"+{delta_sev:.3f} IDF1\n(Absorção)",
+        f"{delta_sev:+.3f} IDF1\n({retencao_txt})",
         xy=(x_idx[-1], lstm_idf1[-1]),
         xytext=(x_idx[-1] - 0.7, lstm_idf1[-1] + 0.03),
         arrowprops=dict(arrowstyle="->", color=color_lstm, lw=1.5),
@@ -627,7 +641,7 @@ def plot_stress_detector_results(results: list, seq_name: str = "MOT17-09", save
 
     ax2.set_xlabel("mAP por Quadro (Qualidade do Detector)", fontsize=10, fontweight="bold")
     ax2.set_ylabel("IDF1 (Consistência Temporal)", fontsize=10, fontweight="bold")
-    ax2.set_title("2. Descolamento mAP vs IDF1\n(LSTM possui menor taxa de perda)", fontsize=11, fontweight="bold")
+    ax2.set_title("2. Trajetória no Espaço mAP vs IDF1", fontsize=11, fontweight="bold")
     ax2.grid(True, linestyle=":", alpha=0.6)
     ax2.legend(loc="lower right", fontsize=9)
 
@@ -648,7 +662,7 @@ def plot_stress_detector_results(results: list, seq_name: str = "MOT17-09", save
     ax3.set_xticklabels(levels, fontweight="bold")
     ax3.set_xlabel("Intensidade de Degradação", fontsize=10, fontweight="bold")
     ax3.set_ylabel("Número de ID Switches", fontsize=10, fontweight="bold")
-    ax3.set_title("3. Contagem de ID Switches\n(LSTM reduz fragmentações espúrias)", fontsize=11, fontweight="bold")
+    ax3.set_title("3. Comparação de ID Switches por Nível", fontsize=11, fontweight="bold")
     ax3.grid(axis="y", linestyle=":", alpha=0.6)
     ax3.legend(loc="upper left", fontsize=9)
 

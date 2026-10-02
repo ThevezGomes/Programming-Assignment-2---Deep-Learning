@@ -1,27 +1,29 @@
 """
 src/metrics.py
-Implementação de métricas de tracking e NMS de autoria própria:
+Implementação de métricas de tracking e NMS de autoria própria para o PA2:
 - custom_nms: Implementação própria sem usar torchvision.ops.nms
 - calculate_iou e box_iou_matrix: Cálculo de IoU entre caixas [x, y, w, h]
-- compute_idf1: IDF1 oficial (Ristani et al., 2016) via Hungarian matching global
-- compute_id_switches_and_fragmentations: Contagem explícita de switches e fragmentações
-- compute_map_per_frame: mAP de detecção por quadro para o gráfico de descolamento
-- evaluate_tracking: Avaliação completa de trajetórias
+- compute_idf1: IDF1 oficial (Ristani et al., 2016 / TrackEval) com matriz de sobreposição global
+- compute_id_switches_and_fragmentations: Contagem CLEAR-MOT (preserva par anterior antes do Hungarian)
+- compute_map_per_frame: mAP de detecção por quadro usando confiança como score com ordenação estável
+- evaluate_tracking: Avaliação consolidada com id_count_error
+- run_unit_tests: Bateria de testes unitários com assert (casos a, b, c, d e invariância de AP)
 """
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+from src.config import EVAL_IOU
 
 
 def calculate_iou(box1, box2):
     """
     Calcula IoU entre duas caixas no formato [x, y, w, h] (top-left, width, height).
     """
-    x1_min, y1_min = box1[0], box1[1]
-    x1_max, y1_max = box1[0] + box1[2], box1[1] + box1[3]
+    x1_min, y1_min = float(box1[0]), float(box1[1])
+    x1_max, y1_max = float(box1[0] + box1[2]), float(box1[1] + box1[3])
 
-    x2_min, y2_min = box2[0], box2[1]
-    x2_max, y2_max = box2[0] + box2[2], box2[1] + box2[3]
+    x2_min, y2_min = float(box2[0]), float(box2[1])
+    x2_max, y2_max = float(box2[0] + box2[2]), float(box2[1] + box2[3])
 
     inter_xmin = max(x1_min, x2_min)
     inter_ymin = max(y1_min, y2_min)
@@ -32,8 +34,8 @@ def calculate_iou(box1, box2):
     inter_h = max(0.0, inter_ymax - inter_ymin)
     inter_area = inter_w * inter_h
 
-    area1 = max(0.0, box1[2]) * max(0.0, box1[3])
-    area2 = max(0.0, box2[2]) * max(0.0, box2[3])
+    area1 = max(0.0, float(box1[2])) * max(0.0, float(box1[3]))
+    area2 = max(0.0, float(box2[2])) * max(0.0, float(box2[3]))
 
     union_area = area1 + area2 - inter_area
     if union_area <= 0.0:
@@ -70,12 +72,12 @@ def box_iou_matrix(boxes_a, boxes_b):
     inter_h = np.maximum(0.0, inter_y2 - inter_y1)
     inter_area = inter_w * inter_h
 
-    area_a = boxes_a[:, 2] * boxes_a[:, 3]
-    area_b = boxes_b[:, 2] * boxes_b[:, 3]
+    area_a = np.maximum(0.0, boxes_a[:, 2]) * np.maximum(0.0, boxes_a[:, 3])
+    area_b = np.maximum(0.0, boxes_b[:, 2]) * np.maximum(0.0, boxes_b[:, 3])
     union_area = area_a[:, None] + area_b[None, :] - inter_area
 
     iou = np.where(union_area > 0, inter_area / np.maximum(union_area, 1e-7), 0.0)
-    return iou
+    return iou.astype(np.float32)
 
 
 def custom_nms(boxes, scores, iou_threshold=0.5):
@@ -98,7 +100,7 @@ def custom_nms(boxes, scores, iou_threshold=0.5):
     y2 = boxes[:, 1] + boxes[:, 3]
     areas = np.maximum(0.0, boxes[:, 2]) * np.maximum(0.0, boxes[:, 3])
 
-    order = scores.argsort()[::-1]
+    order = scores.argsort(kind="mergesort")[::-1]
     keep = []
 
     while order.size > 0:
@@ -123,26 +125,38 @@ def custom_nms(boxes, scores, iou_threshold=0.5):
     return keep
 
 
-def compute_idf1(gt_data, pred_data, iou_threshold=0.5):
-    """
-    Calcula IDF1 oficial (Ristani et al., 2016) via Hungarian matching global.
-    gt_data: dict {frame: {id: [x, y, w, h]}} ou list/array de [frame, id, x, y, w, h]
-    pred_data: dict {frame: {id: [x, y, w, h]}} ou list/array de [frame, id, x, y, w, h]
-    """
-    def _to_dict(d):
-        if isinstance(d, dict):
-            return d
+def _to_trajectory_dict(d):
+    """Converte dados para dict {frame: {id: [x, y, w, h]}}."""
+    if isinstance(d, dict):
         out = {}
-        for row in d:
-            f, tid = int(row[0]), int(row[1])
-            box = np.asarray(row[2:6], dtype=np.float32)
-            if f not in out:
-                out[f] = {}
-            out[f][tid] = box
+        for f, objs in d.items():
+            out[int(f)] = {}
+            if isinstance(objs, dict):
+                for tid, b in objs.items():
+                    out[int(f)][int(tid)] = np.asarray(b[:4], dtype=np.float32)
+            else:
+                for row in objs:
+                    out[int(f)][int(row[1])] = np.asarray(row[2:6], dtype=np.float32)
         return out
+    out = {}
+    for row in d:
+        f, tid = int(row[0]), int(row[1])
+        box = np.asarray(row[2:6], dtype=np.float32)
+        if f not in out:
+            out[f] = {}
+        out[f][tid] = box
+    return out
 
-    gt_dict = _to_dict(gt_data)
-    pred_dict = _to_dict(pred_data)
+
+def compute_idf1(gt_data, pred_data, iou_threshold=EVAL_IOU):
+    """
+    Calcula IDF1 oficial (Ristani et al., 2016 / TrackEval):
+    - C[i, j] acumula o número de quadros onde o IoU entre GT i e Pred j é >= iou_threshold,
+      SEM bipartite matching intermediário por quadro.
+    - Matching húngaro global único entre trajetórias sobre C.
+    """
+    gt_dict = _to_trajectory_dict(gt_data)
+    pred_dict = _to_trajectory_dict(pred_data)
 
     gt_ids = sorted(list({tid for f in gt_dict.values() for tid in f.keys()}))
     pred_ids = sorted(list({tid for f in pred_dict.values() for tid in f.keys()}))
@@ -161,30 +175,27 @@ def compute_idf1(gt_data, pred_data, iou_threshold=0.5):
     gt_to_idx = {gid: i for i, gid in enumerate(gt_ids)}
     pred_to_idx = {pid: j for j, pid in enumerate(pred_ids)}
 
-    # Matriz de sobreposição C[i, j] = frames onde GT i casa com Pred j com IoU >= iou_threshold
     cost_matrix = np.zeros((n_gt, n_pred), dtype=np.float32)
 
-    all_frames = set(gt_dict.keys()).union(set(pred_dict.keys()))
+    all_frames = set(gt_dict.keys()).intersection(set(pred_dict.keys()))
     for f in all_frames:
-        gts = gt_dict.get(f, {})
-        preds = pred_dict.get(f, {})
+        gts = gt_dict[f]
+        preds = pred_dict[f]
         if not gts or not preds:
             continue
 
         f_gt_ids = list(gts.keys())
         f_pred_ids = list(preds.keys())
-        f_gt_boxes = np.array([gts[gid] for gid in f_gt_ids])
-        f_pred_boxes = np.array([preds[pid] for pid in f_pred_ids])
+        f_gt_boxes = np.array([gts[gid] for gid in f_gt_ids], dtype=np.float32)
+        f_pred_boxes = np.array([preds[pid] for pid in f_pred_ids], dtype=np.float32)
 
         ious = box_iou_matrix(f_gt_boxes, f_pred_boxes)
-        r_ind, c_ind = linear_sum_assignment(-ious)
-        for r, c in zip(r_ind, c_ind):
-            if ious[r, c] >= iou_threshold:
-                gid = f_gt_ids[r]
-                pid = f_pred_ids[c]
-                cost_matrix[gt_to_idx[gid], pred_to_idx[pid]] += 1.0
+        for r_idx, gid in enumerate(f_gt_ids):
+            for c_idx, pid in enumerate(f_pred_ids):
+                if ious[r_idx, c_idx] >= iou_threshold:
+                    cost_matrix[gt_to_idx[gid], pred_to_idx[pid]] += 1.0
 
-    # Matching global entre trajetórias
+    # Matching global entre identidades de trajetórias
     row_ind, col_ind = linear_sum_assignment(-cost_matrix)
     idtp = int(sum(cost_matrix[r, c] for r, c in zip(row_ind, col_ind)))
 
@@ -205,24 +216,16 @@ def compute_idf1(gt_data, pred_data, iou_threshold=0.5):
     }
 
 
-def compute_id_switches_and_fragmentations(gt_data, pred_data, iou_threshold=0.5):
+def compute_id_switches_and_fragmentations(gt_data, pred_data, iou_threshold=EVAL_IOU):
     """
-    Contagem de trocas de identidade (ID switches) e fragmentações (quebras na track).
+    Contagem de trocas de identidade (ID switches) e fragmentações conforme CLEAR-MOT:
+    Em cada quadro:
+    1. Mantém pares (GT, Pred) ativos no quadro imediatamente anterior se IoU >= limiar;
+    2. Roda matching húngaro apenas entre os GTs e detecções restantes;
+    3. Registra ID switches e fragmentações sobre a associação temporal.
     """
-    def _to_dict(d):
-        if isinstance(d, dict):
-            return d
-        out = {}
-        for row in d:
-            f, tid = int(row[0]), int(row[1])
-            box = np.asarray(row[2:6], dtype=np.float32)
-            if f not in out:
-                out[f] = {}
-            out[f][tid] = box
-        return out
-
-    gt_dict = _to_dict(gt_data)
-    pred_dict = _to_dict(pred_data)
+    gt_dict = _to_trajectory_dict(gt_data)
+    pred_dict = _to_trajectory_dict(pred_data)
 
     all_frames = sorted(list(set(gt_dict.keys()).union(set(pred_dict.keys()))))
 
@@ -231,33 +234,57 @@ def compute_id_switches_and_fragmentations(gt_data, pred_data, iou_threshold=0.5
     id_switches = 0
     fragmentations = 0
 
+    prev_frame_matches = {}
+
     for f in all_frames:
         gts = gt_dict.get(f, {})
         preds = pred_dict.get(f, {})
-        f_matches = {}
+        curr_frame_matches = {}
 
         if gts and preds:
             f_gt_ids = list(gts.keys())
             f_pred_ids = list(preds.keys())
-            f_gt_boxes = np.array([gts[gid] for gid in f_gt_ids])
-            f_pred_boxes = np.array([preds[pid] for pid in f_pred_ids])
 
-            ious = box_iou_matrix(f_gt_boxes, f_pred_boxes)
-            r_ind, c_ind = linear_sum_assignment(-ious)
-            for r, c in zip(r_ind, c_ind):
-                if ious[r, c] >= iou_threshold:
-                    f_matches[f_gt_ids[r]] = f_pred_ids[c]
+            matched_gts = set()
+            matched_preds = set()
 
+            # Passo 1: Manter associações anteriores válidas (CLEAR-MOT rule)
+            for gid, pid in prev_frame_matches.items():
+                if gid in gts and pid in preds:
+                    iou = calculate_iou(gts[gid], preds[pid])
+                    if iou >= iou_threshold:
+                        curr_frame_matches[gid] = pid
+                        matched_gts.add(gid)
+                        matched_preds.add(pid)
+
+            # Passo 2: Hungarian apenas sobre os elementos não casados no Passo 1
+            rem_gt_ids = [gid for gid in f_gt_ids if gid not in matched_gts]
+            rem_pred_ids = [pid for pid in f_pred_ids if pid not in matched_preds]
+
+            if rem_gt_ids and rem_pred_ids:
+                rem_gt_boxes = np.array([gts[gid] for gid in rem_gt_ids], dtype=np.float32)
+                rem_pred_boxes = np.array([preds[pid] for pid in rem_pred_ids], dtype=np.float32)
+                ious = box_iou_matrix(rem_gt_boxes, rem_pred_boxes)
+                r_ind, c_ind = linear_sum_assignment(-ious)
+                for r, c in zip(r_ind, c_ind):
+                    if ious[r, c] >= iou_threshold:
+                        gid = rem_gt_ids[r]
+                        pid = rem_pred_ids[c]
+                        curr_frame_matches[gid] = pid
+
+        # Passo 3: Identificar switches e fragmentações
         for gid in gts.keys():
-            if gid in f_matches:
-                curr_pred = f_matches[gid]
+            if gid in curr_frame_matches:
+                curr_pid = curr_frame_matches[gid]
                 if gid in last_pred:
-                    if curr_pred != last_pred[gid]:
+                    if curr_pid != last_pred[gid]:
                         id_switches += 1
                     if f > last_frame[gid] + 1:
                         fragmentations += 1
-                last_pred[gid] = curr_pred
+                last_pred[gid] = curr_pid
                 last_frame[gid] = f
+
+        prev_frame_matches = curr_frame_matches
 
     return {
         "id_switches": id_switches,
@@ -265,10 +292,12 @@ def compute_id_switches_and_fragmentations(gt_data, pred_data, iou_threshold=0.5
     }
 
 
-def compute_map_per_frame(gt_dict, det_dict, iou_threshold=0.5):
+def compute_map_per_frame(gt_dict, det_dict, iou_threshold=EVAL_IOU):
     """
-    Calcula Average Precision (AP) por quadro para avaliar a qualidade pura do detector
-    (usado no Painel de Descolamento da Parte 1).
+    Calcula Average Precision (AP) por quadro para avaliar a qualidade pura do detector:
+    - Ordena detecções de forma estável por score/confiança decrescente.
+    - Associa cada detecção ao GT de maior IoU; se o GT já foi casado, gera FP.
+    - Invariante à ordem inicial de caixas com scores idênticos ou permutados.
     """
     all_frames = sorted(list(set(gt_dict.keys()).union(set(det_dict.keys()))))
     frame_aps = []
@@ -277,7 +306,13 @@ def compute_map_per_frame(gt_dict, det_dict, iou_threshold=0.5):
         gts = gt_dict.get(f, {})
         dets = det_dict.get(f, [])
 
-        n_gt = len(gts)
+        # Formata GTs para array (N, 4)
+        if isinstance(gts, dict):
+            gt_boxes = np.array([gts[k][:4] for k in gts], dtype=np.float32) if gts else np.empty((0, 4), dtype=np.float32)
+        else:
+            gt_boxes = np.array([g[2:6] for g in gts], dtype=np.float32) if len(gts) > 0 else np.empty((0, 4), dtype=np.float32)
+
+        n_gt = len(gt_boxes)
         if n_gt == 0:
             continue
 
@@ -285,62 +320,85 @@ def compute_map_per_frame(gt_dict, det_dict, iou_threshold=0.5):
             frame_aps.append(0.0)
             continue
 
-        # dets: list of (box, score) ordenados por score decrescente
+        # Extrai [x, y, w, h] e score
+        boxes_list = []
+        scores_list = []
+
         if isinstance(dets, dict):
-            det_boxes = [dets[k] for k in dets]
-            det_scores = [1.0] * len(det_boxes)
-        elif len(dets) > 0 and len(dets[0]) >= 6:
-            # Formato [frame, id, x, y, w, h, conf]
-            det_boxes = [d[2:6] for d in dets]
-            det_scores = [d[6] if len(d) > 6 else 1.0 for d in dets]
+            for k, v in dets.items():
+                boxes_list.append(v[:4])
+                scores_list.append(float(v[4]) if len(v) > 4 else 1.0)
         else:
-            det_boxes = [d[:4] for d in dets]
-            det_scores = [1.0] * len(det_boxes)
+            for d in dets:
+                # Pode vir como [frame, id, x, y, w, h, conf] ou [x, y, w, h, conf] ou [x, y, w, h]
+                if len(d) >= 7:
+                    boxes_list.append(d[2:6])
+                    scores_list.append(float(d[6]))
+                elif len(d) == 5:
+                    boxes_list.append(d[:4])
+                    scores_list.append(float(d[4]))
+                elif len(d) == 6:
+                    boxes_list.append(d[2:6])
+                    scores_list.append(1.0)
+                else:
+                    boxes_list.append(d[:4])
+                    scores_list.append(1.0)
 
-        order = np.argsort(det_scores)[::-1]
-        det_boxes = np.array(det_boxes)[order]
+        det_boxes = np.asarray(boxes_list, dtype=np.float32)
+        det_scores = np.asarray(scores_list, dtype=np.float32)
 
-        gt_boxes = np.array(list(gts.values()))
+        # Ordenação estável decrescente por score
+        order = np.argsort(-det_scores, kind="mergesort")
+        det_boxes = det_boxes[order]
+        det_scores = det_scores[order]
+
         matched_gt = set()
-
-        tp = np.zeros(len(det_boxes))
-        fp = np.zeros(len(det_boxes))
+        tp = np.zeros(len(det_boxes), dtype=np.float32)
+        fp = np.zeros(len(det_boxes), dtype=np.float32)
 
         ious = box_iou_matrix(det_boxes, gt_boxes)
+
         for i in range(len(det_boxes)):
             best_iou = 0.0
             best_gt = -1
-            for j in range(len(gt_boxes)):
-                if j not in matched_gt and ious[i, j] > best_iou:
+            for j in range(n_gt):
+                if ious[i, j] > best_iou:
                     best_iou = ious[i, j]
                     best_gt = j
+
             if best_iou >= iou_threshold and best_gt != -1:
-                tp[i] = 1.0
-                matched_gt.add(best_gt)
+                if best_gt not in matched_gt:
+                    tp[i] = 1.0
+                    matched_gt.add(best_gt)
+                else:
+                    fp[i] = 1.0
             else:
                 fp[i] = 1.0
 
         cum_tp = np.cumsum(tp)
         cum_fp = np.cumsum(fp)
         prec = cum_tp / (cum_tp + cum_fp + 1e-7)
-        rec = cum_tp / n_gt
+        rec = cum_tp / float(n_gt)
 
-        # 11-point interpolation or area under curve
+        # Interpolação de 11 pontos oficial VOC
         ap = 0.0
         for t in np.arange(0.0, 1.1, 0.1):
-            p = np.max(prec[rec >= t]) if np.sum(rec >= t) > 0 else 0.0
+            mask = rec >= (t - 1e-6)
+            p = np.max(prec[mask]) if np.any(mask) else 0.0
             ap += p / 11.0
-        frame_aps.append(ap)
+
+        frame_aps.append(float(ap))
 
     return float(np.mean(frame_aps)) if frame_aps else 0.0
 
 
-def evaluate_tracking(gt_data, pred_data, iou_threshold=0.5):
+def evaluate_tracking(gt_data, pred_data, iou_threshold=EVAL_IOU):
     """
-    Avaliação consolidada de uma sequência de rastreamento.
+    Avaliação consolidada de uma sequência de rastreamento no protocolo unificado EVAL_IOU.
+    Retorna IDF1, IDP, IDR, ID Switches, Fragmentações, contagem de IDs e id_count_error.
     """
-    idf1_res = compute_idf1(gt_data, pred_data, iou_threshold)
-    idsw_res = compute_id_switches_and_fragmentations(gt_data, pred_data, iou_threshold)
+    idf1_res = compute_idf1(gt_data, pred_data, iou_threshold=iou_threshold)
+    idsw_res = compute_id_switches_and_fragmentations(gt_data, pred_data, iou_threshold=iou_threshold)
 
     def _get_unique(d):
         if isinstance(d, dict):
@@ -351,6 +409,8 @@ def evaluate_tracking(gt_data, pred_data, iou_threshold=0.5):
     unique_pred = _get_unique(pred_data)
     ratio_ids = (unique_pred / unique_gt) if unique_gt > 0 else 0.0
     switches_per_gt = (idsw_res["id_switches"] / unique_gt) if unique_gt > 0 else 0.0
+    id_count_error = (unique_pred - unique_gt) / unique_gt if unique_gt > 0 else 0.0
+    abs_id_count_error = abs(unique_pred - unique_gt) / unique_gt if unique_gt > 0 else 0.0
 
     return {
         "idf1": idf1_res["idf1"],
@@ -361,32 +421,28 @@ def evaluate_tracking(gt_data, pred_data, iou_threshold=0.5):
         "unique_gt_ids": unique_gt,
         "unique_pred_ids": unique_pred,
         "ratio_ids": ratio_ids,
-        "switches_per_gt": switches_per_gt
+        "switches_per_gt": switches_per_gt,
+        "id_count_error": id_count_error,
+        "abs_id_count_error": abs_id_count_error,
     }
 
 
 def run_unit_tests(verbose: bool = True):
     """
-    Parte 0 (Item 3) - Testes unitarios construidos a mao:
-
-    (a) Predicao == Ground Truth  =>  IDF1 = 1.0  e  ID Switches = 0
-    (b) Duas identidades trocadas a partir do quadro k=11  =>  2 switches, IDF1 = 0.5
-    (c) Uma track partida em dois IDs distintos (objeto fragmentado)
-        =>  1 switch, IDF1 = 0.5, unique_pred_ids = 2 (GT tem 1)
-
-    Nota: (b) e (c) tem IDF1 igual mas causas diferentes:
-    (b) confusao entre dois objetos => contagem correta, identidades trocadas
-    (c) fragmentacao de um objeto   => contagem inflada, um objeto virou dois IDs
+    Testes unitários rigorosos das métricas com assert:
+    (a) Predição == Ground Truth => IDF1 == 1.0 e switches == 0
+    (b) Duas identidades trocadas a partir de k=11 (N=20) => IDF1 == 0.5, switches == 2, IDs pred == 2
+    (c) Dois objetos, um quebrado em dois IDs no meio (N=20) => IDF1 == 0.75, switches == 1, IDs pred == 3
+    (d) Objeto partido em dois IDs com gap de oclusão => Fragmentations == 1
+    (e) Teste obrigatório mAP: 5 acertos (conf 0.9) + 3 FPs (conf 0.4), FPs no início e fim dão o mesmo mAP 1.0
     """
-    SEP = "=" * 65
+    SEP = "=" * 70
     if verbose:
         print(SEP)
-        print("PARTE 0 (Item 3) - TESTES UNITARIOS DAS METRICAS")
+        print("VALIDAÇÃO UNITÁRIA DAS MÉTRICAS DE RASTREAMENTO E DETECÇÃO")
         print(SEP)
 
-    all_passed = True
-
-    # --- CASO (a): Predicao identica ao GT ---
+    # (a) Predição idêntica ao GT
     gt_a, pred_a = {}, {}
     for f in range(1, 21):
         gt_a[f] = {
@@ -395,60 +451,100 @@ def run_unit_tests(verbose: bool = True):
         }
         pred_a[f] = {k: v.copy() for k, v in gt_a[f].items()}
 
-    res_a = evaluate_tracking(gt_a, pred_a)
-    ok_a = np.isclose(res_a["idf1"], 1.0) and res_a["id_switches"] == 0
-    all_passed = all_passed and ok_a
+    res_a = evaluate_tracking(gt_a, pred_a, iou_threshold=0.5)
+    assert np.isclose(res_a["idf1"], 1.0), f"Esperado IDF1=1.0, obtido {res_a['idf1']}"
+    assert res_a["id_switches"] == 0, f"Esperado 0 switches, obtido {res_a['id_switches']}"
+    assert res_a["fragmentations"] == 0, f"Esperado 0 frag, obtido {res_a['fragmentations']}"
     if verbose:
-        print(f"\n{'[PASS]' if ok_a else '[FAIL]'} Caso (a) -- Predicao == Ground Truth")
-        print(f"       IDF1        = {res_a['idf1']:.4f}  (esperado: 1.0000)")
-        print(f"       ID Switches = {res_a['id_switches']}  (esperado: 0)")
+        print("[PASS] Caso (a) — Predição == GT: IDF1=1.0000, IDSW=0")
 
-    # --- CASO (b): Duas identidades trocadas a partir do frame k=11 ---
+    # (b) Dois objetos trocados em k=11 (N=20)
     gt_b = {f: {k: v.copy() for k, v in gt_a[f].items()} for f in gt_a}
     pred_b = {}
     for f in range(1, 21):
         if f < 11:
-            pred_b[f] = {k: v.copy() for k, v in gt_a[f].items()}
+            pred_b[f] = {1: gt_b[f][1].copy(), 2: gt_b[f][2].copy()}
         else:
-            pred_b[f] = {1: gt_a[f][2].copy(), 2: gt_a[f][1].copy()}
+            pred_b[f] = {1: gt_b[f][2].copy(), 2: gt_b[f][1].copy()}
 
-    res_b = evaluate_tracking(gt_b, pred_b)
-    ok_b = np.isclose(res_b["idf1"], 0.5, atol=0.01) and res_b["id_switches"] == 2
-    all_passed = all_passed and ok_b
+    res_b = evaluate_tracking(gt_b, pred_b, iou_threshold=0.5)
+    assert np.isclose(res_b["idf1"], 0.5, atol=1e-3), f"Esperado IDF1=0.5, obtido {res_b['idf1']}"
+    assert res_b["id_switches"] == 2, f"Esperado 2 switches, obtido {res_b['id_switches']}"
+    assert res_b["unique_pred_ids"] == 2, f"Esperado 2 IDs pred, obtido {res_b['unique_pred_ids']}"
     if verbose:
-        print(f"\n{'[PASS]' if ok_b else '[FAIL]'} Caso (b) -- Troca de 2 identidades a partir de k=11")
-        print(f"       IDF1        = {res_b['idf1']:.4f}  (esperado: ~0.5000)")
-        print(f"       ID Switches = {res_b['id_switches']}  (esperado: 2)")
-        print("       DIAGNOSTICO: tracker CONFUNDIU identidades dos dois objetos")
+        print("[PASS] Caso (b) — 2 objetos trocados: IDF1=0.5000, IDSW=2, Pred IDs=2")
 
-    # --- CASO (c): Track unica partida em dois IDs ---
-    gt_c = {f: {1: np.array([10 + f, 20 + f, 20, 30], dtype=np.float32)}
-            for f in range(1, 21)}
+    # (c) Dois objetos, um quebrado em dois IDs no meio (N=20)
+    gt_c = {f: {k: v.copy() for k, v in gt_a[f].items()} for f in gt_a}
     pred_c = {}
-    for f in range(1, 11):
-        pred_c[f] = {1: gt_c[f][1].copy()}
-    for f in range(11, 21):
-        pred_c[f] = {2: gt_c[f][1].copy()}
+    for f in range(1, 21):
+        if f < 11:
+            pred_c[f] = {1: gt_c[f][1].copy(), 2: gt_c[f][2].copy()}
+        else:
+            pred_c[f] = {1: gt_c[f][1].copy(), 3: gt_c[f][2].copy()}
 
-    res_c = evaluate_tracking(gt_c, pred_c)
-    ok_c = (np.isclose(res_c["idf1"], 0.5, atol=0.01)
-            and res_c["id_switches"] == 1
-            and res_c["unique_pred_ids"] == 2
-            and res_c["unique_gt_ids"] == 1)
-    all_passed = all_passed and ok_c
+    res_c = evaluate_tracking(gt_c, pred_c, iou_threshold=0.5)
+    assert np.isclose(res_c["idf1"], 0.75, atol=1e-3), f"Esperado IDF1=0.75, obtido {res_c['idf1']}"
+    assert res_c["id_switches"] == 1, f"Esperado 1 switch, obtido {res_c['id_switches']}"
+    assert res_c["unique_pred_ids"] == 3, f"Esperado 3 IDs pred, obtido {res_c['unique_pred_ids']}"
     if verbose:
-        print(f"\n{'[PASS]' if ok_c else '[FAIL]'} Caso (c) -- Track unica fragmentada em 2 IDs")
-        print(f"       IDF1           = {res_c['idf1']:.4f}  (esperado: ~0.5000)")
-        print(f"       ID Switches    = {res_c['id_switches']}  (esperado: 1)")
-        print(f"       IDs GT / Pred  = {res_c['unique_gt_ids']} GT / {res_c['unique_pred_ids']} Pred")
-        print("       DIAGNOSTICO: contagem INFLADA (2 IDs pred para 1 objeto real)")
-        print("\n       Diferenca entre (b) e (c):")
-        print("       (b) 2 objetos trocados   => switches=2, qtd de IDs correta")
-        print("       (c) 1 objeto fragmentado => switches=1, qtd de IDs inflada")
+        print("[PASS] Caso (c) — 2 objetos, 1 quebrado ao meio: IDF1=0.7500, IDSW=1, Pred IDs=3")
 
+    # (d) Objeto partido em dois IDs com gap de oclusão
+    gt_d = {f: {1: np.array([20 + f, 30 + f, 20, 40], dtype=np.float32)} for f in range(1, 21)}
+    pred_d = {}
+    for f in range(1, 9):
+        pred_d[f] = {1: gt_d[f][1].copy()}
+    # frames 9, 10, 11 sem detecção (gap de oclusão)
+    for f in range(12, 21):
+        pred_d[f] = {2: gt_d[f][1].copy()}
+
+    res_d = evaluate_tracking(gt_d, pred_d, iou_threshold=0.5)
+    assert res_d["fragmentations"] == 1, f"Esperado Frag=1, obtido {res_d['fragmentations']}"
+    assert res_d["id_switches"] == 1, f"Esperado IDSW=1, obtido {res_d['id_switches']}"
     if verbose:
-        print(f"\n{SEP}")
-        print("TODOS OS TESTES APROVADOS!" if all_passed else "ATENCAO: ALGUM TESTE FALHOU!")
+        print(f"[PASS] Caso (d) — Objeto partido com oclusão: Frag={res_d['fragmentations']}, IDSW={res_d['id_switches']}")
+
+    # (e) Teste obrigatório de mAP (P0-6): 5 acertos (conf 0.9) + 3 FPs (conf 0.4)
+    gt_map = {
+        1: {
+            1: np.array([10, 10, 20, 20], dtype=np.float32),
+            2: np.array([40, 10, 20, 20], dtype=np.float32),
+            3: np.array([70, 10, 20, 20], dtype=np.float32),
+            4: np.array([100, 10, 20, 20], dtype=np.float32),
+            5: np.array([130, 10, 20, 20], dtype=np.float32),
+        }
+    }
+    tps_correct = [
+        [10, 10, 20, 20, 0.9],
+        [40, 10, 20, 20, 0.9],
+        [70, 10, 20, 20, 0.9],
+        [100, 10, 20, 20, 0.9],
+        [130, 10, 20, 20, 0.9],
+    ]
+    fps_noise = [
+        [200, 200, 20, 20, 0.4],
+        [230, 200, 20, 20, 0.4],
+        [260, 200, 20, 20, 0.4],
+    ]
+
+    # Teste 1: FPs no início da lista
+    det_map_fps_first = {1: fps_noise + tps_correct}
+    map1 = compute_map_per_frame(gt_map, det_map_fps_first, iou_threshold=0.5)
+
+    # Teste 2: FPs no final da lista
+    det_map_fps_last = {1: tps_correct + fps_noise}
+    map2 = compute_map_per_frame(gt_map, det_map_fps_last, iou_threshold=0.5)
+
+    assert np.isclose(map1, 1.0), f"Esperado mAP=1.0 com FPs no início, obtido {map1}"
+    assert np.isclose(map2, 1.0), f"Esperado mAP=1.0 com FPs no fim, obtido {map2}"
+    assert np.isclose(map1, map2), f"mAP não é invariante à ordem: {map1} vs {map2}"
+    if verbose:
+        print(f"[PASS] Caso (e) — mAP independente da ordem das caixas: map1={map1:.4f}, map2={map2:.4f}")
         print(SEP)
 
-    return all_passed
+    return True
+
+
+if __name__ == "__main__":
+    run_unit_tests(verbose=True)

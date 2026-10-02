@@ -4,6 +4,7 @@ Implementação própria de IDF1, ID switches e fragmentações conforme requisi
 """
 
 from src.metrics import (
+    EVAL_IOU,
     calculate_iou,
     box_iou_matrix,
     custom_nms,
@@ -15,6 +16,7 @@ from src.metrics import (
 )
 
 __all__ = [
+    "EVAL_IOU",
     "calculate_iou",
     "box_iou_matrix",
     "custom_nms",
@@ -31,4 +33,3 @@ if __name__ == "__main__":
     if not success:
         exit(1)
     print("\nImplementação de métricas validada com sucesso.")
-

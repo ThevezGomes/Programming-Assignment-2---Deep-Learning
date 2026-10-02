@@ -22,6 +22,7 @@ def generate_synthetic_video(
     typical_velocity: float = 3.0,
     occlusion_duration: int = 10,
     noise_level: float = 0.05,
+    contrast: float = 1.0,
     seed: int = 42
 ):
     """
@@ -35,7 +36,12 @@ def generate_synthetic_video(
     typical_velocity  : velocidade típica em pixels/frame
     occlusion_duration: duração média de oclusão forçada entre dois objetos
     noise_level       : desvio padrão do ruído nos tamanhos das elipses (fraction)
+    contrast          : fator de escala do contraste das elipses (padrão 1.0)
     seed              : semente aleatória para reprodutibilidade
+
+    Limite de Visibilidade:
+    Objetos com menos de 8% de área visível no z-buffer (visible_frac < 0.08) são
+    considerados em oclusão total e removidos do ground truth naquele quadro.
 
     Retorna
     -------
@@ -123,7 +129,7 @@ def generate_synthetic_video(
 
             mask = ((x_rot / semi_a[obj_idx]) ** 2 + (y_rot / semi_b[obj_idx]) ** 2) <= 1.0
 
-            frame[mask] = colors[obj_idx]
+            frame[mask] = np.clip(np.array(colors[obj_idx]) * contrast, 0, 255).astype(np.uint8)
             z_buffer[mask] = obj_idx
 
         frames.append(frame)
@@ -182,7 +188,7 @@ def generate_controlled_occlusion_sequence(
     Uma elipse (Objeto 1, alvo verde no fundo z=0) passa diretamente atrás de uma
     segunda elipse (Objeto 2, oclusor vermelho na frente z=1).
 
-    O Objeto 1 desaparece completamente (0 pixels visíveis no z-buffer) por exatamente
+    O Objeto 1 fica ocluído no z-buffer (< 8% de área visível) por aproximadamente
     `occlusion_duration` quadros e reaparece em seguida com a mesma identidade.
 
     Retorna
@@ -295,6 +301,9 @@ def degrade_detections(gt_by_frame: dict, drop_prob: float = 0.1,
 
     Retorna det_by_frame: dict {frame: [[x, y, w, h, conf], ...]}
     """
+    if drop_prob == 0.0 and noise_std == 0.0 and fp_rate == 0.0:
+        return {f: [[*box.tolist(), 1.0] for box in boxes.values()] for f, boxes in gt_by_frame.items()}
+
     rng = np.random.default_rng(seed)
     det_by_frame = {}
 
@@ -321,14 +330,15 @@ def degrade_detections(gt_by_frame: dict, drop_prob: float = 0.1,
             dets.append([*noisy_box.tolist(), conf])
 
         # 3. Falsos positivos aleatórios
-        n_fp = rng.poisson(fp_rate * len(gt_boxes) + 0.1)
-        for _ in range(int(n_fp)):
-            x = float(rng.uniform(0, frame_size - 10))
-            y = float(rng.uniform(0, frame_size - 10))
-            w = float(rng.uniform(5, min(30, frame_size - x)))
-            h = float(rng.uniform(5, min(30, frame_size - y)))
-            conf = float(rng.uniform(0.3, 0.6))
-            dets.append([x, y, w, h, conf])
+        if fp_rate > 0.0 and len(gt_boxes) > 0:
+            n_fp = rng.poisson(fp_rate * len(gt_boxes))
+            for _ in range(int(n_fp)):
+                x = float(rng.uniform(0, frame_size - 10))
+                y = float(rng.uniform(0, frame_size - 10))
+                w = float(rng.uniform(5, min(30, frame_size - x)))
+                h = float(rng.uniform(5, min(30, frame_size - y)))
+                conf = float(rng.uniform(0.3, 0.6))
+                dets.append([x, y, w, h, conf])
 
         det_by_frame[frame_id] = dets
 
@@ -386,9 +396,10 @@ def load_mot17_sequence(seq_path: str, min_det_conf: float = 0.0,
                 frame = int(parts[0])
                 tid   = int(parts[1])
                 x, y, w, h = float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
-                cls   = int(parts[7]) if len(parts) > 7 else 1
-                vis   = float(parts[8]) if len(parts) > 8 else 1.0
-                if filter_pedestrians and (cls != 1 or vis <= 0.0):
+                conf_gt = float(parts[6]) if len(parts) > 6 else 1.0
+                cls     = int(parts[7]) if len(parts) > 7 else 1
+                vis     = float(parts[8]) if len(parts) > 8 else 1.0
+                if filter_pedestrians and (cls != 1 or vis <= 0.0 or conf_gt == 0):
                     continue
                 gt_by_frame.setdefault(frame, {})[tid] = np.array([x, y, w, h], dtype=np.float32)
 

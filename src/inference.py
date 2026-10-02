@@ -1,17 +1,23 @@
 """
 src/inference.py
-Inferência com modelos de detecção pré-treinados do torchvision e rastreador:
-- infer_torchvision_frame: Detecção de pessoas usando Faster R-CNN do torchvision com NMS próprio
-- run_sequence_inference: Execução completa sobre uma sequência ou vídeo
+Inferência com modelos de detecção pré-treinados do torchvision e rastreador recorrente:
+- Suporte a qualquer sequência: pasta MOT17, pasta de imagens genérica ou arquivo de vídeo (.mp4/.avi)
+- Resolução dinâmica extraída de seqinfo.ini ou do primeiro quadro (sem assumir 1920x1080)
+- Detecção sob demanda com Faster R-CNN (COCO) e custom_nms quando det.txt não estiver disponível
+- Geração simultânea de GIF e MP4
+- Contagem robusta de pedestres únicos com filtro de confirmação min_hits
 """
 
 import os
+import cv2
 import torch
 import torchvision
-from PIL import Image
+from PIL import Image, ImageDraw
 import numpy as np
+
 from src.metrics import custom_nms
-from src.tracker import NaiveTracker
+from src.tracker import RNNMotionTracker
+from src.config import FINAL_CHECKPOINT_PATH, DEFAULT_TRACKER_IOU, DEFAULT_MAX_LOST_FRAMES
 
 
 def get_torchvision_person_detector(device="cpu"):
@@ -75,7 +81,6 @@ def infer_torchvision_frame(model, image, min_score: float = 0.5, nms_iou: float
 def get_distinct_color(track_id: int):
     """Gera uma cor RGB viva e consistente baseada no hash/id da track."""
     import colorsys
-    # Espaçamento uniforme pela proporção áurea
     golden_ratio_conjugate = 0.618033988749895
     h = (track_id * golden_ratio_conjugate) % 1.0
     s = 0.85
@@ -86,75 +91,124 @@ def get_distinct_color(track_id: int):
 
 def run_tracking_inference(
     seq_path: str,
-    model_path: str = "checkpoints/motion_lstm_best.pt",
+    model_path: str = FINAL_CHECKPOINT_PATH,
     output_video_path: str = "results/inferencia_output.gif",
-    max_frames: int = 60,
-    fps: int = 8,
-    render_scale: float = 0.5,
+    max_frames: int = None,
+    fps: int = 10,
+    render_scale: float = 1.0,
     velocity_damping: float = 0.85,
     sigma_inflation: float = 0.30,
-    iou_threshold: float = 0.30,
-    max_lost_frames: int = 15,
+    iou_threshold: float = DEFAULT_TRACKER_IOU,
+    max_lost_frames: int = DEFAULT_MAX_LOST_FRAMES,
+    min_hits: int = 3,
+    min_det_score: float = 0.5,
     device: str = "cpu"
 ) -> dict:
     """
     Executa inferência ponta a ponta sobre uma sequência qualquer sem retreino:
-    - Carrega a sequência MOT17 (imagens em img1 e detecções em det/det.txt);
-    - Se det.txt não existir, usa Faster R-CNN do torchvision com NMS próprio;
-    - Executa o RNNMotionTracker com memória recorrente e amortecimento;
-    - Produz vídeo (GIF animado) com caixas coloridas consistentemente por ID;
-    - Contabiliza o total de identidades únicas observadas no vídeo.
-
-    Retorna dict com:
-    - sequence: nome da sequência
-    - total_frames: total de quadros processados
-    - unique_objects_count: contagem de pedestres únicos identificados
-    - output_video_path: caminho do vídeo gerado
+    - Suporta 3 tipos de entrada:
+      (a) Pasta MOT17 (img1/ + det/det.txt opcional);
+      (b) Pasta de imagens arbitrárias (ordena alfanumericamente);
+      (c) Arquivo de vídeo (.mp4, .avi, etc.).
+    - Dimensões extraídas dinamicamente de seqinfo.ini ou do primeiro quadro.
+    - Detector Faster R-CNN + custom_nms quando det.txt não existir.
+    - max_frames=None processa todos os quadros.
+    - Exporta GIF e MP4 sincronizados.
+    - Contabiliza apenas tracks com pelo menos min_hits confirmações.
     """
-    from PIL import ImageDraw, ImageFont
-    from src.data import parse_seqinfo
-    from src.tracker import RNNMotionTracker
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+    elif device == "mps" and not torch.backends.mps.is_available():
+        device = "cpu"
 
     if not os.path.exists(seq_path):
-        raise FileNotFoundError(f"Caminho da sequência não encontrado: {seq_path}")
+        raise FileNotFoundError(f"Caminho não encontrado: {seq_path}")
 
-    seq_info = parse_seqinfo(seq_path)
-    seq_name = seq_info.get("name", os.path.basename(seq_path))
-    im_w = int(seq_info.get("imWidth", 1920))
-    im_h = int(seq_info.get("imHeight", 1080))
-    im_dir = os.path.join(seq_path, seq_info.get("imDir", "img1"))
-    im_ext = seq_info.get("imExt", ".jpg")
+    is_video_file = os.path.isfile(seq_path) and seq_path.lower().endswith((".mp4", ".avi", ".mov", ".mkv"))
 
-    # Identifica arquivos de imagem disponíveis
-    image_files = sorted([
-        f for f in os.listdir(im_dir) if f.lower().endswith(im_ext.lower())
-    ]) if os.path.exists(im_dir) else []
-
-    if max_frames is not None and max_frames > 0:
-        image_files = image_files[:max_frames]
-
-    # Carrega detecções se det.txt existir
-    det_file = os.path.join(seq_path, "det", "det.txt")
+    raw_frames = []
     det_by_frame = {}
-    if os.path.exists(det_file):
-        with open(det_file, "r") as f:
-            for line in f:
-                parts = line.strip().split(",")
-                if len(parts) < 6:
-                    continue
-                fr = int(parts[0])
-                x, y, w, h = float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
-                conf = float(parts[6]) if len(parts) > 6 else 1.0
-                det_by_frame.setdefault(fr, []).append([x, y, w, h, conf])
+    seq_name = os.path.basename(seq_path)
+    im_w, im_h = None, None
+
+    # Caso (c): Arquivo de vídeo
+    if is_video_file:
+        cap = cv2.VideoCapture(seq_path)
+        fps_in = cap.get(cv2.CAP_PROP_FPS)
+        if fps_in > 0:
+            fps = int(fps_in)
+        frame_idx = 0
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            raw_frames.append(Image.fromarray(frame_rgb))
+            frame_idx += 1
+            if max_frames is not None and frame_idx >= max_frames:
+                break
+        cap.release()
+        if raw_frames:
+            im_w, im_h = raw_frames[0].size
+
+    # Caso (a) ou (b): Pasta no disco
     else:
-        print("det.txt não encontrado. Utilizando detector Faster R-CNN (COCO) com custom_nms...")
-        detector = get_torchvision_person_detector(device=device)
-        for i, fname in enumerate(image_files, start=1):
+        from src.data import parse_seqinfo
+        seq_info = parse_seqinfo(seq_path)
+        im_dir = os.path.join(seq_path, seq_info.get("imDir", "img1"))
+        if not os.path.exists(im_dir):
+            im_dir = seq_path  # Pasta com imagens diretamente
+
+        im_exts = (".jpg", ".jpeg", ".png", ".bmp")
+        image_files = sorted([
+            f for f in os.listdir(im_dir) if f.lower().endswith(im_exts)
+        ])
+
+        if max_frames is not None and max_frames > 0:
+            image_files = image_files[:max_frames]
+
+        for fname in image_files:
             fpath = os.path.join(im_dir, fname)
-            dets = infer_torchvision_frame(detector, fpath, min_score=0.5, nms_iou=0.5, device=device)
+            raw_frames.append(Image.open(fpath).convert("RGB"))
+
+        # Lê dimensões de seqinfo.ini ou do primeiro frame
+        if "imWidth" in seq_info and "imHeight" in seq_info:
+            im_w = int(seq_info["imWidth"])
+            im_h = int(seq_info["imHeight"])
+        elif raw_frames:
+            im_w, im_h = raw_frames[0].size
+
+        # Carrega det.txt público se existir
+        det_file = os.path.join(seq_path, "det", "det.txt")
+        if os.path.exists(det_file):
+            with open(det_file, "r") as f:
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) < 6:
+                        continue
+                    fr = int(parts[0])
+                    x, y, w, h = float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
+                    conf = float(parts[6]) if len(parts) > 6 else 1.0
+                    det_by_frame.setdefault(fr, []).append([x, y, w, h, conf])
+
+    total_frames = len(raw_frames)
+    if total_frames == 0:
+        raise ValueError(f"Nenhum quadro válido encontrado para inferência em: {seq_path}")
+
+    if im_w is None or im_h is None:
+        im_w, im_h = raw_frames[0].size
+
+    print(f"Iniciando inferência em {seq_name} ({total_frames} quadros | Resolução: {im_w}x{im_h})...")
+
+    # Se não houver det.txt, executa Faster R-CNN + custom_nms
+    if not det_by_frame:
+        print("Detecções públicas não encontradas. Executando Faster R-CNN (COCO) com custom_nms...")
+        detector = get_torchvision_person_detector(device=device)
+        for i, pil_img in enumerate(raw_frames, start=1):
+            dets = infer_torchvision_frame(detector, pil_img, min_score=min_det_score, device=device)
             det_by_frame[i] = dets
 
-    # Inicializa o rastreador com modelo pré-treinado
+    # Inicializa rastreador com dimensões corretas
     tracker = RNNMotionTracker(
         model=model_path,
         iou_threshold=iou_threshold,
@@ -165,29 +219,28 @@ def run_tracking_inference(
         device=device
     )
 
-    all_unique_ids = set()
+    track_hit_counts = {}
     rendered_frames = []
-    trail_history = {}  # {track_id: [(cx, cy), ...]}
+    trail_history = {}
 
-    print(f"Executando rastreamento recorrente em {len(image_files)} quadros de {seq_name}...")
-
-    for f_idx, fname in enumerate(image_files, start=1):
-        fpath = os.path.join(im_dir, fname)
-        img = Image.open(fpath).convert("RGB")
-        orig_w, orig_h = img.size
-
+    for f_idx, pil_img in enumerate(raw_frames, start=1):
         dets = det_by_frame.get(f_idx, [])
-        active_tracks = tracker.step(dets, f_idx)
+        active_tracks = tracker.step(dets, f_idx, im_width=float(im_w), im_height=float(im_h))
 
-        # Atualiza conjunto de identidades únicas
         for tid in active_tracks.keys():
-            all_unique_ids.add(tid)
+            track_hit_counts[tid] = track_hit_counts.get(tid, 0) + 1
 
-        # Renderização visual sobre a imagem
-        draw = ImageDraw.Draw(img)
+        # Desenho sobre o quadro
+        img_draw = pil_img.copy()
+        draw = ImageDraw.Draw(img_draw)
 
-        # Desenha rastro (trajetória histórica) e caixas
+        confirmed_active = 0
         for tid, box in active_tracks.items():
+            if track_hit_counts.get(tid, 0) < min_hits:
+                # Track ainda em período de confirmação
+                continue
+
+            confirmed_active += 1
             color = get_distinct_color(tid)
             x, y, w, h = box
             cx, cy = x + w / 2.0, y + h / 2.0
@@ -196,67 +249,81 @@ def run_tracking_inference(
             if len(trail_history[tid]) > 20:
                 trail_history[tid] = trail_history[tid][-20:]
 
-            # Rastro
             pts = trail_history[tid]
             if len(pts) > 1:
                 draw.line(pts, fill=color, width=3)
 
-            # Bounding Box
-            draw.rectangle([x, y, x + w, y + h], outline=color, width=4)
+            draw.rectangle([x, y, x + w, y + h], outline=color, width=3)
 
-            # Tag com ID
             tag_text = f"ID:{tid}"
-            tag_w = len(tag_text) * 11 + 8
-            tag_h = 20
+            tag_w = len(tag_text) * 10 + 6
+            tag_h = 18
             tag_top = max(0, y - tag_h - 2)
             draw.rectangle([x, tag_top, x + tag_w, tag_top + tag_h], fill=color)
-            draw.text((x + 4, tag_top + 2), tag_text, fill=(255, 255, 255))
+            draw.text((x + 3, tag_top + 1), tag_text, fill=(255, 255, 255))
 
-        # Cabeçalho Informativo no topo do vídeo
-        header_h = 44
-        draw.rectangle([0, 0, orig_w, header_h], fill=(20, 24, 32))
+        # Cabeçalho
+        confirmed_total_unique = len([tid for tid, count in track_hit_counts.items() if count >= min_hits])
+        header_h = 40
+        draw.rectangle([0, 0, im_w, header_h], fill=(20, 24, 32))
         info_text = (
-            f"Sequência: {seq_name} | Quadro: {f_idx:03d}/{len(image_files):03d} | "
-            f"Tracks Ativas: {len(active_tracks):02d} | Objetos Únicos Totais: {len(all_unique_ids):02d}"
+            f"Seq: {seq_name} ({im_w}x{im_h}) | Quadro: {f_idx:03d}/{total_frames:03d} | "
+            f"Ativas: {confirmed_active:02d} | Objetos Únicos Confirmados (min_hits={min_hits}): {confirmed_total_unique:02d}"
         )
-        draw.text((16, 12), info_text, fill=(0, 240, 180))
+        draw.text((12, 11), info_text, fill=(0, 240, 180))
 
-        # Redimensiona para formato mais leve se render_scale < 1.0
         if render_scale < 1.0:
-            new_size = (int(orig_w * render_scale), int(orig_h * render_scale))
-            img = img.resize(new_size, Image.Resampling.BILINEAR)
+            new_size = (int(im_w * render_scale), int(im_h * render_scale))
+            img_draw = img_draw.resize(new_size, Image.Resampling.BILINEAR)
 
-        rendered_frames.append(img)
+        rendered_frames.append(img_draw)
 
-    # Salva o arquivo de vídeo (GIF animado de alta qualidade)
-    if rendered_frames and output_video_path:
-        os.makedirs(os.path.dirname(output_video_path), exist_ok=True)
-        duration_ms = int(1000.0 / fps)
-        rendered_frames[0].save(
-            output_video_path,
-            save_all=True,
-            append_images=rendered_frames[1:],
-            duration=duration_ms,
-            loop=0,
-            optimize=True
-        )
-        print(f"Vídeo de inferência gerado com sucesso: {output_video_path}")
+    # Identidades confirmadas
+    confirmed_ids = sorted([tid for tid, count in track_hit_counts.items() if count >= min_hits])
+
+    # 1. Salva GIF animado
+    gif_path = output_video_path if output_video_path.endswith(".gif") else os.path.splitext(output_video_path)[0] + ".gif"
+    os.makedirs(os.path.dirname(gif_path), exist_ok=True)
+    duration_ms = int(1000.0 / fps)
+    rendered_frames[0].save(
+        gif_path,
+        save_all=True,
+        append_images=rendered_frames[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=True
+    )
+    print(f"GIF salvo em: {gif_path}")
+
+    # 2. Salva vídeo MP4
+    mp4_path = os.path.splitext(output_video_path)[0] + ".mp4"
+    frame_w, frame_h = rendered_frames[0].size
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out_writer = cv2.VideoWriter(mp4_path, fourcc, float(fps), (frame_w, frame_h))
+    for r_img in rendered_frames:
+        frame_cv = cv2.cvtColor(np.array(r_img), cv2.COLOR_RGB2BGR)
+        out_writer.write(frame_cv)
+    out_writer.release()
+    print(f"Vídeo MP4 salvo em: {mp4_path}")
 
     summary = {
         "sequence": seq_name,
-        "total_frames": len(image_files),
-        "unique_objects_count": len(all_unique_ids),
-        "unique_ids": sorted(list(all_unique_ids)),
-        "output_video_path": output_video_path
+        "resolution": f"{im_w}x{im_h}",
+        "total_frames": total_frames,
+        "unique_objects_count": len(confirmed_ids),
+        "unique_ids": confirmed_ids,
+        "gif_path": gif_path,
+        "mp4_path": mp4_path,
+        "output_video_path": gif_path
     }
 
-    print("=" * 60)
-    print("RESUMO DA INFERÊNCIA")
-    print(f"Sequência processada     : {seq_name}")
-    print(f"Quadros analisados       : {len(image_files)}")
-    print(f"Contagem de Objetos Únicos: {len(all_unique_ids)} pedestres")
-    print(f"Arquivo de saída         : {output_video_path}")
-    print("=" * 60)
+    print("=" * 65)
+    print("RESUMO DA INFERÊNCIA CONCLUÍDA")
+    print(f"Sequência processada        : {seq_name}")
+    print(f"Resolução real utilizada    : {im_w}x{im_h}")
+    print(f"Quadros analisados          : {total_frames}")
+    print(f"Pedestres Únicos Confirmados: {len(confirmed_ids)} (min_hits={min_hits})")
+    print(f"Arquivos gerados            : {gif_path} e {mp4_path}")
+    print("=" * 65)
 
     return summary
-

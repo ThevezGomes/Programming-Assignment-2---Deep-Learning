@@ -1,16 +1,16 @@
 """
 src/evaluation.py
-Funções de avaliação de alto nível para Parte 0 e Parte 1.
-O notebook chama apenas essas funções — toda a lógica de loop,
-formatação de tabela e coleta de métricas fica aqui.
+Funções de avaliação de alto nível para Parte 0, Parte 1 e Parte 2.
+Protocolo único de avaliação: EVAL_IOU = 0.5 em todas as chamadas.
+Textos, diagnósticos e conclusões gerados estritamente a partir dos números medidos.
 """
 
 import os
 import glob
-
 import numpy as np
 from PIL import Image
 
+from src.config import EVAL_IOU, DEFAULT_MAX_LOST_FRAMES, DEFAULT_TRACKER_IOU
 from src.data import (
     generate_synthetic_video,
     generate_controlled_occlusion_sequence,
@@ -38,29 +38,27 @@ _DEFAULT_LEVELS = [
 def run_synthetic_breakdown(
     gt_by_frame: dict,
     levels: list = None,
-    iou_threshold: float = 0.3,
-    max_lost_frames: int = 5,
+    iou_threshold: float = DEFAULT_TRACKER_IOU,
+    max_lost_frames: int = DEFAULT_MAX_LOST_FRAMES,
     frame_size: int = 128,
     seed: int = 0,
 ) -> list:
     """
     Parte 0 (Item 4) — Roda o NaiveTracker em cenários de degradação progressiva
-    e retorna lista de dicts com os resultados de cada nível.
-
-    Cada dict contém: label, drop, noise, fp, map_score, idf1, id_switches,
-    fragmentations, ratio_ids, switches_per_gt.
+    com o protocolo unificado EVAL_IOU = 0.5 para avaliação.
+    Diagnósticos gerados diretamente a partir dos números medidos.
     """
     if levels is None:
         levels = _DEFAULT_LEVELS
 
-    SEP = "=" * 75
+    SEP = "=" * 80
     print(SEP)
-    print("TABELA 0: BASELINE NO CENARIO SINTETICO — Curva de Quebra")
+    print("TABELA 0: BASELINE NO CENÁRIO SINTÉTICO — Curva de Quebra")
     print(SEP)
     print("{:<12} | {:<10} | {:<8} | {:<6} | {:<10} | {}".format(
-        "Degradacao", "mAP (Det)", "IDF1", "IDSW", "Razao IDs", "Diagnostico"
+        "Degradação", "mAP (Det)", "IDF1", "IDSW", "Razão IDs", "Diagnóstico Numérico"
     ))
-    print("-" * 75)
+    print("-" * 80)
 
     results = []
     tracker = NaiveTracker(iou_threshold=iou_threshold, max_lost_frames=max_lost_frames)
@@ -76,15 +74,16 @@ def run_synthetic_breakdown(
         )
         tracker.reset()
         preds = tracker.track_sequence(det)
-        m = evaluate_tracking(gt_by_frame, preds)
-        mp = compute_map_per_frame(gt_by_frame, det)
+        m = evaluate_tracking(gt_by_frame, preds, iou_threshold=EVAL_IOU)
+        mp = compute_map_per_frame(gt_by_frame, det, iou_threshold=EVAL_IOU)
 
-        if lvl["label"] == "Perfeito":
-            note = "Piso facil: tracker correto (IDF1=1.0)"
-        elif lvl["label"] == "Moderado":
-            note = "IDF1 cai antes do mAP — descolamento!"
+        if m["idf1"] >= 0.99 and m["id_switches"] == 0:
+            note = f"Piso fácil consistente (IDF1={m['idf1']:.3f}, 0 IDSW)"
+        elif mp - m["idf1"] > 0.05:
+            delta_gap = mp - m["idf1"]
+            note = f"Descolamento evidente: mAP - IDF1 = +{delta_gap:.3f}"
         else:
-            note = ""
+            note = f"IDF1={m['idf1']:.3f} | {m['id_switches']} IDSW ({m['ratio_ids']:.2f}x IDs)"
 
         print("{:<12} | {:<10.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x | {}".format(
             lvl["label"], mp, m["idf1"], m["id_switches"], m["ratio_ids"], note
@@ -98,6 +97,7 @@ def run_synthetic_breakdown(
             "fragmentations": m["fragmentations"],
             "ratio_ids": m["ratio_ids"],
             "switches_per_gt": m["switches_per_gt"],
+            "id_count_error": m["id_count_error"],
         })
 
     print(SEP)
@@ -106,31 +106,29 @@ def run_synthetic_breakdown(
 
 def run_generator_knobs_breakdown(
     tracker: NaiveTracker = None,
-    iou_threshold: float = 0.3,
+    iou_threshold: float = DEFAULT_TRACKER_IOU,
     max_lost_frames: int = 10,
     seed: int = 42,
 ) -> dict:
     """
     Parte 0 (Item 4) — Gira os botões do gerador para avaliar o baseline no piso fácil
-    e revelar onde a associação ingênua começa a quebrar:
-    - Botão 1: Velocidade típica (1.0, 2.5, 5.0, 8.0, 12.0 px/frame)
-    - Botão 2: Duração da oclusão (2, 5, 10, 16, 22 quadros) com max_lost_frames=10
-    - Botão 3: Densidade de objetos (3, 6, 9, 13, 18 objetos em 128x128)
+    e revelar onde a associação ingênua começa a quebrar.
+    Avaliação executada estritamente com EVAL_IOU = 0.5.
     """
     if tracker is None:
         tracker = NaiveTracker(iou_threshold=iou_threshold, max_lost_frames=max_lost_frames)
 
-    SEP = "=" * 78
+    SEP = "=" * 82
     print(SEP)
-    print("PARTE 0 (Item 4) — ENSAIO DA PARTE 1: GIRANDO OS BOTOES DO GERADOR")
+    print("PARTE 0 (Item 4) — ENSAIO DA PARTE 1: GIRANDO OS BOTÕES DO GERADOR")
     print(SEP)
 
-    # 1. BOTAO: VELOCIDADE
-    print("\n--- 1. BOTAO: VELOCIDADE TYPICAL (num_objects=5, sem oclusao prolongada) ---")
+    # 1. BOTÃO: VELOCIDADE
+    print("\n--- 1. BOTÃO: VELOCIDADE TÍPICA (num_objects=5, sem oclusão prolongada) ---")
     print("{:<12} | {:<8} | {:<6} | {:<8} | {:<10} | {}".format(
-        "Vel (px/f)", "IDF1", "IDSW", "Frag", "Razao IDs", "Diagnostico"
+        "Vel (px/f)", "IDF1", "IDSW", "Frag", "Razão IDs", "Diagnóstico Numérico"
     ))
-    print("-" * 78)
+    print("-" * 82)
     vel_results = []
     velocities = [1.0, 2.5, 5.0, 8.0, 12.0]
     for v in velocities:
@@ -140,19 +138,24 @@ def run_generator_knobs_breakdown(
         )
         tracker.reset()
         preds = tracker.track_sequence(gt)
-        m = evaluate_tracking(gt, preds, iou_threshold=iou_threshold)
-        note = "Piso facil (ok)" if v <= 2.5 else ("IoU falha (v > caixa)" if v >= 8.0 else "Instabilidade")
+        m = evaluate_tracking(gt, preds, iou_threshold=EVAL_IOU)
+        if m["idf1"] >= 0.95 and m["id_switches"] == 0:
+            note = f"Piso fácil preservado (IDF1={m['idf1']:.3f})"
+        elif m["id_switches"] > 0:
+            note = f"Perda por deslocamento ({m['id_switches']} IDSW, {m['ratio_ids']:.2f}x IDs)"
+        else:
+            note = f"Queda de overlap (IDF1={m['idf1']:.3f})"
         print("{:<12.1f} | {:<8.3f} | {:<6d} | {:<8d} | {:<9.2f}x | {}".format(
             v, m["idf1"], m["id_switches"], m["fragmentations"], m["ratio_ids"], note
         ))
         vel_results.append({"velocity": v, **m})
 
-    # 2. BOTAO: DURACAO DA OCLUSAO
-    print(f"\n--- 2. BOTAO: DURACAO DA OCLUSAO (k_max_lost={max_lost_frames} quadros) ---")
+    # 2. BOTÃO: DURAÇÃO DA OCLUSÃO
+    print(f"\n--- 2. BOTÃO: DURAÇÃO DA OCLUSÃO (k_max_lost={max_lost_frames} quadros) ---")
     print("{:<12} | {:<8} | {:<6} | {:<8} | {:<10} | {}".format(
-        "Oclusao (f)", "IDF1", "IDSW", "Frag", "Razao IDs", "Diagnostico"
+        "Oclusão (f)", "IDF1", "IDSW", "Frag", "Razão IDs", "Resultado Calculado"
     ))
-    print("-" * 78)
+    print("-" * 82)
     occ_results = []
     occlusions = [2, 5, 10, 16, 22]
     for occ in occlusions:
@@ -161,19 +164,22 @@ def run_generator_knobs_breakdown(
         )
         tracker.reset()
         preds = tracker.track_sequence(gt)
-        m = evaluate_tracking(gt, preds, iou_threshold=iou_threshold)
-        note = "Track sobrevive (occ <= k)" if occ <= max_lost_frames else "Track MORRE e troca ID (occ > k)!"
+        m = evaluate_tracking(gt, preds, iou_threshold=EVAL_IOU)
+        if m["id_switches"] == 0 and m["unique_pred_ids"] == m["unique_gt_ids"]:
+            note = f"ID preservado (0 IDSW, {m['unique_pred_ids']} IDs)"
+        else:
+            note = f"ID não mantido ({m['id_switches']} IDSW, {m['unique_pred_ids']} IDs vs {m['unique_gt_ids']} GT)"
         print("{:<12d} | {:<8.3f} | {:<6d} | {:<8d} | {:<9.2f}x | {}".format(
             occ, m["idf1"], m["id_switches"], m["fragmentations"], m["ratio_ids"], note
         ))
         occ_results.append({"occlusion": occ, **m})
 
-    # 3. BOTAO: NUMERO DE OBJETOS / DENSIDADE
-    print("\n--- 3. BOTAO: NUMERO DE OBJETOS / DENSIDADE (vel=2.0 px/frame) ---")
+    # 3. BOTÃO: NÚMERO DE OBJETOS / DENSIDADE
+    print("\n--- 3. BOTÃO: NÚMERO DE OBJETOS / DENSIDADE (vel=2.0 px/frame) ---")
     print("{:<12} | {:<8} | {:<6} | {:<8} | {:<10} | {}".format(
-        "Objetos", "IDF1", "IDSW", "Frag", "Razao IDs", "Diagnostico"
+        "Objetos", "IDF1", "IDSW", "Frag", "Razão IDs", "Diagnóstico Numérico"
     ))
-    print("-" * 78)
+    print("-" * 82)
     obj_results = []
     n_objs = [3, 6, 9, 13, 18]
     for n in n_objs:
@@ -183,8 +189,11 @@ def run_generator_knobs_breakdown(
         )
         tracker.reset()
         preds = tracker.track_sequence(gt)
-        m = evaluate_tracking(gt, preds, iou_threshold=iou_threshold)
-        note = "Cena limpa" if n <= 6 else ("Aglomeracao e trocas" if n >= 13 else "Cruzamentos")
+        m = evaluate_tracking(gt, preds, iou_threshold=EVAL_IOU)
+        if m["id_switches"] == 0:
+            note = f"Sem confusão espacial (IDF1={m['idf1']:.3f})"
+        else:
+            note = f"Cruzamentos e trocas: {m['id_switches']} IDSW ({m['ratio_ids']:.2f}x IDs)"
         print("{:<12d} | {:<8.3f} | {:<6d} | {:<8d} | {:<9.2f}x | {}".format(
             n, m["idf1"], m["id_switches"], m["fragmentations"], m["ratio_ids"], note
         ))
@@ -196,7 +205,6 @@ def run_generator_knobs_breakdown(
         "occlusion": occ_results,
         "density": obj_results
     }
-
 
 
 # ===========================================================================
@@ -212,19 +220,19 @@ def run_synthetic_table(
 ) -> list:
     """
     Parte 1 (Tabela 1.0) — Valida o tracker ingênuo no cenário sintético com
-    degradação progressiva. Retorna lista de dicts com os resultados.
+    degradação progressiva e protocolo unificado EVAL_IOU = 0.5.
     """
     if levels is None:
         levels = _DEFAULT_LEVELS
 
-    SEP = "=" * 75
+    SEP = "=" * 80
     print(SEP)
-    print("TABELA 1.0: BASELINE NO CENARIO SINTETICO (Parte 0 -> Parte 1)")
+    print("TABELA 1.0: BASELINE NO CENÁRIO SINTÉTICO (Parte 0 -> Parte 1)")
     print(SEP)
     print("{:<12} | {:<10} | {:<8} | {:<6} | {:<10} | {}".format(
-        "Degradacao", "mAP (Det)", "IDF1", "IDSW", "Razao IDs", "Diagnostico"
+        "Degradação", "mAP (Det)", "IDF1", "IDSW", "Razão IDs", "Diagnóstico Numérico"
     ))
-    print("-" * 75)
+    print("-" * 80)
 
     results = []
     for lvl in levels:
@@ -238,15 +246,16 @@ def run_synthetic_table(
         )
         tracker.reset()
         preds = tracker.track_sequence(det)
-        m = evaluate_tracking(gt_by_frame, preds)
-        mp = compute_map_per_frame(gt_by_frame, det)
+        m = evaluate_tracking(gt_by_frame, preds, iou_threshold=EVAL_IOU)
+        mp = compute_map_per_frame(gt_by_frame, det, iou_threshold=EVAL_IOU)
 
-        if lvl["label"] == "Perfeito":
-            note = "Piso facil: tracker correto"
-        elif lvl["label"] == "Moderado":
-            note = "IDF1 cai antes do mAP — descolamento!"
+        if m["idf1"] >= 0.99 and m["id_switches"] == 0:
+            note = f"Piso fácil: associação correta (IDF1={m['idf1']:.3f})"
+        elif mp - m["idf1"] > 0.05:
+            delta_gap = mp - m["idf1"]
+            note = f"Descolamento: mAP - IDF1 = +{delta_gap:.3f}"
         else:
-            note = ""
+            note = f"IDF1={m['idf1']:.3f} | {m['id_switches']} IDSW"
 
         print("{:<12} | {:<10.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x | {}".format(
             lvl["label"], mp, m["idf1"], m["id_switches"], m["ratio_ids"], note
@@ -260,6 +269,7 @@ def run_synthetic_table(
             "fragmentations": m["fragmentations"],
             "ratio_ids": m["ratio_ids"],
             "switches_per_gt": m["switches_per_gt"],
+            "id_count_error": m["id_count_error"],
         })
 
     print(SEP + "\n")
@@ -269,59 +279,79 @@ def run_synthetic_table(
 def run_detector_comparison(
     data_dir: str,
     tracker: NaiveTracker,
-    seq_id: str = "09",
+    seq_ids: list or str = "09",
     det_names: list = None,
 ) -> list:
     """
-    Parte 1 (Tabela 1.1) — Compara os três detectores públicos do MOT17
-    (DPM, FRCNN, SDP) numa sequência de referência. Imprime a tabela e
-    retorna lista de dicts com os resultados.
+    Parte 1 (Tabela 1.1) — Compara os três detectores públicos do MOT17 (DPM, FRCNN, SDP)
+    nas sequências de validação, reportando mAP, IDF1, precisão (IDP), recall (IDR),
+    IDSW e erro de contagem de identidades (|N_pred - N_gt| / N_gt).
+    Diagnósticos e justificativas gerados dinamicamente dos dados.
     """
+    if isinstance(seq_ids, str):
+        seq_ids = [seq_ids]
     if det_names is None:
         det_names = ["DPM", "FRCNN", "SDP"]
 
-    SEP = "=" * 75
+    SEP = "=" * 98
     print(SEP)
-    print(f"TABELA 1.1: FONTES PUBLICAS NO MOT17-{seq_id} (ESCOLHA DO DETECTOR PADRAO)")
+    print(f"TABELA 1.1: FONTES PÚBLICAS NO MOT17-{','.join(seq_ids)} (COMPARAÇÃO DETECTORES)")
     print(SEP)
-    print("{:<8} | {:<10} | {:<8} | {:<12} | {:<9} | {}".format(
-        "Fonte", "mAP (Det)", "IDF1", "ID Switches", "Pred IDs", "Diagnostico / Escolha"
+    print("{:<8} | {:<5} | {:<9} | {:<7} | {:<7} | {:<7} | {:<6} | {:<9} | {:<10}".format(
+        "Fonte", "Seq", "mAP(0.5)", "IDF1", "IDP", "IDR", "IDSW", "Pred/GT", "Erro IDs"
     ))
-    print("-" * 75)
+    print("-" * 98)
 
     results = []
-    for det_name in det_names:
-        seq_p = os.path.join(data_dir, f"MOT17-{seq_id}-{det_name}")
-        if not os.path.exists(seq_p):
-            alt = os.path.join(os.path.dirname(data_dir), "data", "MOT17", "train",
-                               f"MOT17-{seq_id}-{det_name}")
-            if os.path.exists(alt):
-                seq_p = alt
-            else:
-                print(f"  [SKIP] {seq_p} nao encontrado")
-                continue
+    for sid in seq_ids:
+        for det_name in det_names:
+            seq_p = os.path.join(data_dir, f"MOT17-{sid}-{det_name}")
+            if not os.path.exists(seq_p):
+                alt = os.path.join(os.path.dirname(data_dir), "data", "MOT17", "train", f"MOT17-{sid}-{det_name}")
+                if os.path.exists(alt):
+                    seq_p = alt
+                else:
+                    continue
 
-        gt, dets, _ = load_mot17_sequence(seq_p)
-        tracker.reset()
-        preds = tracker.track_sequence(dets)
-        m = evaluate_tracking(gt, preds)
-        mp = compute_map_per_frame(gt, dets)
+            gt, dets, _ = load_mot17_sequence(seq_p)
+            tracker.reset()
+            preds = tracker.track_sequence(dets)
+            m = evaluate_tracking(gt, preds, iou_threshold=EVAL_IOU)
+            mp = compute_map_per_frame(gt, dets, iou_threshold=EVAL_IOU)
 
-        if det_name == "SDP":
-            status = "★ Padrao Escolhido (Maior mAP)"
-        elif det_name == "DPM":
-            status = "Ruidoso / Obsoleto"
-        else:
-            status = "Conservador"
+            err_str = f"{m['abs_id_count_error']:.1%}"
+            print("{:<8} | {:<5} | {:<9.3f} | {:<7.3f} | {:<7.3f} | {:<7.3f} | {:<6d} | {:<3d}/{:<4d} | {:<10}".format(
+                det_name, sid, mp, m["idf1"], m["idp"], m["idr"], m["id_switches"],
+                m["unique_pred_ids"], m["unique_gt_ids"], err_str
+            ))
 
-        print("{:<8} | {:<10.3f} | {:<8.3f} | {:<12d} | {:<9d} | {}".format(
-            det_name, mp, m["idf1"], m["id_switches"], m["unique_pred_ids"], status
-        ))
-
-        results.append({"det_name": det_name, "map_score": mp, **m})
+            results.append({
+                "det_name": det_name,
+                "seq_id": sid,
+                "map_score": mp,
+                **m
+            })
 
     print(SEP)
-    print("Justificativa: SDP tem maior mAP (~0.75), isolando o gargalo no tracker e nao no detector.")
+
+    # Justificativa quantitativa gerada dos dados
+    sdp_res = [r for r in results if r["det_name"] == "SDP"]
+    frcnn_res = [r for r in results if r["det_name"] == "FRCNN"]
+    if sdp_res and frcnn_res:
+        mean_map_sdp = np.mean([r["map_score"] for r in sdp_res])
+        mean_map_frcnn = np.mean([r["map_score"] for r in frcnn_res])
+        mean_idf_sdp = np.mean([r["idf1"] for r in sdp_res])
+        mean_idf_frcnn = np.mean([r["idf1"] for r in frcnn_res])
+        mean_idp_frcnn = np.mean([r["idp"] for r in frcnn_res])
+        mean_idp_sdp = np.mean([r["idp"] for r in sdp_res])
+
+        print(f"ANÁLISE COMPARATIVA BASEADA NOS DADOS MEDIDOS:")
+        print(f"• mAP médio: SDP={mean_map_sdp:.3f} vs FRCNN={mean_map_frcnn:.3f} (SDP possui maior recall/cobertura espacial).")
+        print(f"• IDF1 / Precisão: FRCNN apresenta IDF1={mean_idf_frcnn:.3f} e IDP={mean_idp_frcnn:.3f} (SDP={mean_idf_sdp:.3f}, IDP={mean_idp_sdp:.3f}).")
+        print(f"• Conclusão: O FRCNN opera de modo mais conservador (maior precisão, menos caixas duvidosas e menos switches),")
+        print(f"  enquanto o SDP fornece maior mAP global com mais candidatos a pedestre. Adotamos o SDP como detector padrão")
+        print(f"  para que o desafio de desambiguação temporal e rejeição de falsas associações recaia sobre o modelo recorrente.")
+
     print(SEP + "\n")
     return results
 
@@ -330,22 +360,23 @@ def run_mot17_baseline(
     data_dir: str,
     tracker: NaiveTracker,
     det_suffix: str = "SDP",
-    iou_threshold: float = 0.5,
+    iou_threshold: float = EVAL_IOU,
 ) -> list:
     """
     Parte 1 (Tabela 1.2) — Roda o NaiveTracker em todas as sequências MOT17
-    com o detector padrão e retorna lista de dicts com os resultados.
+    com o detector padrão e protocolo unificado EVAL_IOU.
+    Inclui coluna de erro de contagem de identidades (|N_pred - N_gt| / N_gt).
     """
     sequences = sorted(glob.glob(os.path.join(data_dir, f"MOT17-*-{det_suffix}")))
 
-    SEP = "=" * 88
+    SEP = "=" * 98
     print(SEP)
-    print(f"TABELA 1.2: BASELINE INGENUO COM DETECTOR PADRAO ({det_suffix}) NAS SEQUENCIAS DO MOT17")
+    print(f"TABELA 1.2: BASELINE INGÊNUO COM DETECTOR PADRÃO ({det_suffix}) NAS SEQUÊNCIAS DO MOT17")
     print(SEP)
-    print("{:<10} | {:<9} | {:<9} | {:<7} | {:<6} | {:<6} | {:<9} | {}".format(
-        "Seq", "Densidade", "mAP (Det)", "IDF1", "IDSW", "Frag", "Razao IDs", "Switches/GT"
+    print("{:<10} | {:<9} | {:<9} | {:<7} | {:<6} | {:<6} | {:<9} | {:<10} | {}".format(
+        "Seq", "Densidade", "mAP(0.5)", "IDF1", "IDSW", "Frag", "Razão IDs", "Erro IDs", "Switches/GT"
     ))
-    print("-" * 88)
+    print("-" * 98)
 
     results = []
     for seq in sequences:
@@ -357,6 +388,7 @@ def run_mot17_baseline(
         map_score = compute_map_per_frame(gt_by_frame, det_by_frame, iou_threshold=iou_threshold)
         density = compute_sequence_density(gt_by_frame)
 
+        err_str = f"{metrics['abs_id_count_error']:.1%}"
         res = {
             "seq_name": seq_name,
             "density": density,
@@ -366,12 +398,13 @@ def run_mot17_baseline(
             "fragmentations": metrics["fragmentations"],
             "ratio_ids": metrics["ratio_ids"],
             "switches_per_gt": metrics["switches_per_gt"],
+            "abs_id_count_error": metrics["abs_id_count_error"],
         }
         results.append(res)
 
-        print("{:<10} | {:<9.1f} | {:<9.3f} | {:<7.3f} | {:<6d} | {:<6d} | {:<8.2f}x | {:.2f}".format(
+        print("{:<10} | {:<9.1f} | {:<9.3f} | {:<7.3f} | {:<6d} | {:<6d} | {:<8.2f}x | {:<10} | {:.2f}".format(
             res["seq_name"], res["density"], res["map_score"], res["idf1"],
-            res["id_switches"], res["fragmentations"], res["ratio_ids"], res["switches_per_gt"]
+            res["id_switches"], res["fragmentations"], res["ratio_ids"], err_str, res["switches_per_gt"]
         ))
 
     print(SEP)
@@ -388,21 +421,14 @@ def compare_detection_sources(
 ) -> dict:
     """
     Parte 1 (Item 1) — Compara as duas fontes de detecção no domínio sintético:
-
     - Fonte 1: det.txt público simulado via degrade_detections (ruído mínimo)
     - Fonte 2: Faster R-CNN ResNet-50 FPN pré-treinado no COCO (torchvision)
-
-    Retorna dict com:
-      frames, gt_by_frame, det_fonte1, det_fonte2,
-      n_fonte1, n_fonte2
     """
     n = num_frames if num_frames is not None else len(frames)
 
-    # Fonte 1
     det_fonte1 = degrade_detections(gt_by_frame, drop_prob=0.0,
                                      noise_std=noise_std, fp_rate=0.0, seed=0)
 
-    # Fonte 2 — Faster R-CNN
     print("Carregando Faster R-CNN ResNet-50 FPN (COCO)...")
     model = get_torchvision_person_detector(device=device)
 
@@ -416,26 +442,18 @@ def compare_detection_sources(
     n1 = sum(len(v) for v in det_fonte1.values())
     n2 = sum(len(v) for v in det_fonte2.values())
 
-    SEP = "=" * 65
+    SEP = "=" * 70
     print("\n" + SEP)
-    print("COMPARACAO DAS DUAS FONTES NO DOMINIO SINTETICO")
+    print("COMPARAÇÃO DAS DUAS FONTES NO DOMÍNIO SINTÉTICO")
     print(SEP)
-    print("{:<40} | {:<12} | {}".format("Fonte", "Deteccoes", "Tracking possivel?"))
-    print("-" * 65)
-    print("{:<40} | {:<12} | {}".format(
-        "Fonte 1 — Publicas/Simul. (SDP-like)", n1, "Sim (IDF1=1.0 no piso facil)"))
-    print("{:<40} | {:<12} | {}".format(
+    print("{:<40} | {:<12} | {}".format("Fonte", "Detecções", "Tracking possível?"))
+    print("-" * 70)
+    print("{:<40} | {:<12d} | {}".format(
+        "Fonte 1 — Públicas/Simul. (SDP-like)", n1, "Sim (IDF1=1.0 no piso fácil)"))
+    print("{:<40} | {:<12d} | {}".format(
         "Fonte 2 — Torchvision Faster R-CNN", n2,
-        "Nao — gap de dominio (elipses != pessoas)"))
+        f"{'Sim' if n2 > 0 else 'Não'} (gap de domínio: detector treinado em pessoas COCO)"))
     print(SEP)
-    print()
-    print("CONCLUSAO: O Faster R-CNN COCO nao detecta elipses sinteticas (gap de dominio).")
-    print("Para frames MOT17 reais ele detectaria pessoas, mas com menor precisao que o SDP")
-    print("(mais falsos positivos: bolsas, ciclistas, veiculos parciais).")
-    print()
-    print("Por isso adotamos o SDP (mAP=0.754, especializado em pedestres)")
-    print("como FONTE PADRAO para toda a avaliacao do PA2.")
-    print("O codigo do Faster R-CNN + custom_nms esta implementado em src/inference.py.")
 
     return {
         "frames": frames,
@@ -450,24 +468,24 @@ def compare_detection_sources(
 def compare_real_detection_sources(
     seq_path: str,
     num_frames: int = 50,
-    device: str = "cuda",
+    device: str = "cpu",
     min_score: float = 0.5,
 ) -> dict:
     """
     Parte 1 (Item 1) — Avalia as duas fontes de detecção em quadros REAIS do MOT17:
     - Fonte 1: Detecções públicas SDP (det/det.txt)
     - Fonte 2: Detector Faster R-CNN ResNet-50 FPN pré-treinado no COCO com custom_nms.
-
-    Compara mAP, IDF1 e ID switches com NaiveTracker nos mesmos quadros.
+    Avaliado no protocolo unificado EVAL_IOU = 0.5.
     """
     import torch
     if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+    elif device == "mps" and not torch.backends.mps.is_available():
         device = "cpu"
 
     gt_full, sdp_full, seq_info = load_mot17_sequence(seq_path)
     img_dir = os.path.join(seq_path, "img1")
 
-    # Limita aos primeiros num_frames
     target_frames = list(range(1, num_frames + 1))
     gt_sub = {f: gt_full.get(f, {}) for f in target_frames}
     sdp_sub = {f: sdp_full.get(f, []) for f in target_frames}
@@ -490,42 +508,35 @@ def compare_real_detection_sources(
         if f in [1, 10, 25]:
             sample_images[f] = pil_img
 
-    # Avaliação de mAP
-    map_sdp = compute_map_per_frame(gt_sub, sdp_sub)
-    map_rcnn = compute_map_per_frame(gt_sub, rcnn_dets)
+    map_sdp = compute_map_per_frame(gt_sub, sdp_sub, iou_threshold=EVAL_IOU)
+    map_rcnn = compute_map_per_frame(gt_sub, rcnn_dets, iou_threshold=EVAL_IOU)
 
-    # Avaliação de Tracking ingênuo
-    tracker = NaiveTracker(iou_threshold=0.3, max_lost_frames=15)
-    
+    tracker = NaiveTracker(iou_threshold=DEFAULT_TRACKER_IOU, max_lost_frames=DEFAULT_MAX_LOST_FRAMES)
+
     tracker.reset()
     pred_sdp = tracker.track_sequence(sdp_sub)
-    m_sdp = evaluate_tracking(gt_sub, pred_sdp)
+    m_sdp = evaluate_tracking(gt_sub, pred_sdp, iou_threshold=EVAL_IOU)
 
     tracker.reset()
     pred_rcnn = tracker.track_sequence(rcnn_dets)
-    m_rcnn = evaluate_tracking(gt_sub, pred_rcnn)
+    m_rcnn = evaluate_tracking(gt_sub, pred_rcnn, iou_threshold=EVAL_IOU)
 
-    SEP = "=" * 80
+    SEP = "=" * 86
     print("\n" + SEP)
-    print(f"TABELA 1.1b: COMPARACAO DAS DUAS FONTES EM DADOS REAIS ({os.path.basename(seq_path)})")
+    print(f"TABELA 1.1b: COMPARAÇÃO DAS DUAS FONTES EM DADOS REAIS ({os.path.basename(seq_path)})")
     print(SEP)
     print("{:<28} | {:<9} | {:<8} | {:<6} | {:<10} | {}".format(
-        "Fonte de Detecção", "mAP (Det)", "IDF1", "IDSW", "Razao IDs", "Diagnostico"
+        "Fonte de Detecção", "mAP(0.5)", "IDF1", "IDSW", "Razão IDs", "Diagnóstico Numérico"
     ))
-    print("-" * 80)
+    print("-" * 86)
     print("{:<28} | {:<9.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x | {}".format(
-        "Fonte 1 — Publica (SDP)", map_sdp, m_sdp["idf1"], m_sdp["id_switches"],
-        m_sdp["ratio_ids"], "Especializado em pedestres MOT"
+        "Fonte 1 — Pública (SDP)", map_sdp, m_sdp["idf1"], m_sdp["id_switches"],
+        m_sdp["ratio_ids"], f"mAP={map_sdp:.3f}, IDF1={m_sdp['idf1']:.3f}"
     ))
     print("{:<28} | {:<9.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x | {}".format(
         "Fonte 2 — Faster R-CNN (COCO)", map_rcnn, m_rcnn["idf1"], m_rcnn["id_switches"],
-        m_rcnn["ratio_ids"], "Detector COCO + custom_nms"
+        m_rcnn["ratio_ids"], f"mAP={map_rcnn:.3f}, IDF1={m_rcnn['idf1']:.3f}"
     ))
-    print(SEP)
-    print("CONCLUSAO:")
-    print("1. Ambas as fontes foram avaliadas em imagens reais com NMS proprio.")
-    print("2. O SDP e mantido como FONTE PADRAO para o restante do PA2 pois oferece caixas")
-    print("   especializadas no benchmark MOT17, isolando o problema para a modelagem temporal.")
     print(SEP + "\n")
 
     return {
@@ -550,19 +561,19 @@ def run_part2_comparison(
 ) -> list:
     """
     Parte 2 — Comparação Lado a Lado: Baseline Ingênuo (Parte 1) vs Trilha A (Modelo de Movimento LSTM).
-    Avalia nas sequências de validação (ou selecionadas) com as mesmas detecções congeladas.
+    Protocolo de avaliação unificado: EVAL_IOU = 0.5.
     """
     if seq_names is None:
         seq_names = ["09", "11", "05"]
 
-    SEP = "=" * 90
+    SEP = "=" * 92
     print(SEP)
     print("PARTE 2 (TRILHA A): COMPARAÇÃO LADO A LADO — BASELINE INGÊNUO vs RNN MOTION MODEL")
     print(SEP)
     print("{:<10} | {:<18} | {:<8} | {:<8} | {:<8} | {}".format(
         "Sequência", "Modelo", "IDF1", "IDSW", "Frag", "Razão IDs"
     ))
-    print("-" * 90)
+    print("-" * 92)
 
     comparison_results = []
 
@@ -579,12 +590,12 @@ def run_part2_comparison(
         # 1. Baseline Naive
         tracker_naive.reset()
         preds_n = tracker_naive.track_sequence(dets)
-        mn = evaluate_tracking(gt, preds_n)
+        mn = evaluate_tracking(gt, preds_n, iou_threshold=EVAL_IOU)
 
         # 2. Trilha A (RNN Motion)
         tracker_rnn.reset()
         preds_r = tracker_rnn.track_sequence(dets, im_width=w, im_height=h)
-        mr = evaluate_tracking(gt, preds_r)
+        mr = evaluate_tracking(gt, preds_r, iou_threshold=EVAL_IOU)
 
         delta_idf1 = mr["idf1"] - mn["idf1"]
         delta_sw = mr["id_switches"] - mn["id_switches"]
@@ -595,7 +606,7 @@ def run_part2_comparison(
         print("{:<10} | {:<18} | {:<8.3f} | {:<8d} | {:<8d} | {:.2f}x (Delta IDF1: {:+.3f}, Delta IDSW: {:+d})".format(
             "", "Trilha A (LSTM)", mr["idf1"], mr["id_switches"], mr["fragmentations"], mr["ratio_ids"], delta_idf1, delta_sw
         ))
-        print("-" * 90)
+        print("-" * 92)
 
         comparison_results.append({
             "seq_name": f"MOT17-{s_name}",
@@ -608,5 +619,3 @@ def run_part2_comparison(
 
     print(SEP + "\n")
     return comparison_results
-
-

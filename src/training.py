@@ -48,18 +48,32 @@ class TrajectoryDataset(Dataset):
             for tid, seq in tracks.items():
                 if len(seq) < T + 1:
                     continue
-                for start in range(0, len(seq) - T, stride):
-                    chunk = seq[start:start + T + 1]
+                # Agrupa apenas passos estritamente consecutivos no tempo (dt == 1)
+                subtracks = []
+                curr_sub = [seq[0]]
+                for i in range(1, len(seq)):
+                    if seq[i][0] == seq[i - 1][0] + 1:
+                        curr_sub.append(seq[i])
+                    else:
+                        if len(curr_sub) >= T + 1:
+                            subtracks.append(curr_sub)
+                        curr_sub = [seq[i]]
+                if len(curr_sub) >= T + 1:
+                    subtracks.append(curr_sub)
 
-                    # Converte para [cx, cy, w, h] normalizado em [0, 1]
-                    raw_boxes = np.array([item[1] for item in chunk], dtype=np.float32)
-                    cboxes = np.zeros_like(raw_boxes)
-                    cboxes[:, 0] = (raw_boxes[:, 0] + raw_boxes[:, 2] / 2.0) / W
-                    cboxes[:, 1] = (raw_boxes[:, 1] + raw_boxes[:, 3] / 2.0) / H
-                    cboxes[:, 2] = raw_boxes[:, 2] / W
-                    cboxes[:, 3] = raw_boxes[:, 3] / H
+                for sub in subtracks:
+                    for start in range(0, len(sub) - T, stride):
+                        chunk = sub[start:start + T + 1]
 
-                    self.samples.append(cboxes)
+                        # Converte para [cx, cy, w, h] normalizado em [0, 1]
+                        raw_boxes = np.array([item[1] for item in chunk], dtype=np.float32)
+                        cboxes = np.zeros_like(raw_boxes)
+                        cboxes[:, 0] = (raw_boxes[:, 0] + raw_boxes[:, 2] / 2.0) / W
+                        cboxes[:, 1] = (raw_boxes[:, 1] + raw_boxes[:, 3] / 2.0) / H
+                        cboxes[:, 2] = raw_boxes[:, 2] / W
+                        cboxes[:, 3] = raw_boxes[:, 3] / H
+
+                        self.samples.append(cboxes)
 
     def __len__(self):
         return len(self.samples)
@@ -134,7 +148,7 @@ def train_motion_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
-    best_val_loss = float("inf")
+    best_val_smooth_l1 = float("inf")
     history = {"train_loss": [], "val_loss": [], "val_smooth_l1": []}
 
     current_tf = teacher_forcing_ratio
@@ -171,7 +185,7 @@ def train_motion_model(
         current_tf = max(0.0, current_tf - scheduled_sampling_decay)
         scheduler.step()
 
-        # Avaliação na Validação
+        # Avaliação na Validação (rollout livre de observações)
         model.eval()
         val_loss_acc = 0.0
         val_reg_acc = 0.0
@@ -202,8 +216,9 @@ def train_motion_model(
         if verbose:
             print(f"Época [{epoch:02d}/{epochs:02d}] - Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} (Smooth-L1: {val_reg:.4f}) | TF: {current_tf:.2f}")
 
-        if val_loss < best_val_loss and save_path is not None:
-            best_val_loss = val_loss
+        # Salva pelo critério exigido: Smooth-L1 em rollout livre
+        if val_reg < best_val_smooth_l1 and save_path is not None:
+            best_val_smooth_l1 = val_reg
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save({
                 "epoch": epoch,
@@ -211,17 +226,19 @@ def train_motion_model(
                 "cell_type": model.cell_type,
                 "hidden_dim": model.hidden_dim,
                 "num_layers": model.num_layers,
-                "best_val_loss": best_val_loss
+                "predict_uncertainty": model.predict_uncertainty,
+                "best_val_loss": val_loss,
+                "best_val_smooth_l1": best_val_smooth_l1
             }, save_path)
 
     if verbose and save_path:
-        print(f"Treinamento concluído. Checkpoint salvo em {save_path} (Melhor Val Loss: {best_val_loss:.4f})")
+        print(f"Treinamento concluído. Checkpoint salvo em {save_path} (Melhor Val Smooth-L1: {best_val_smooth_l1:.4f})")
 
     return history
 
 
 if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Executando treinamento da Trilha A (MotionPredictor LSTM) no dispositivo: {device}")
     train_loader, val_loader = build_trajectory_dataloaders(
         data_dir="data/MOT17/train", det_suffix="SDP", seq_len=16, batch_size=128, stride=4
@@ -229,8 +246,8 @@ if __name__ == "__main__":
     model = MotionPredictor(cell_type="lstm", hidden_dim=128, num_layers=2, predict_uncertainty=True)
     train_motion_model(
         model, train_loader, val_loader,
-        epochs=6, lr=1e-3, gradient_clip=1.0,
+        epochs=10, lr=1e-3, gradient_clip=1.0,
         save_path="checkpoints/motion_lstm_best.pt",
-        device=device
+        device=device, verbose=True
     )
 
