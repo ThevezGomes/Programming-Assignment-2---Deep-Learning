@@ -59,8 +59,8 @@ def run_ablation_axis1(data_dir="data/MOT17/train", force_recompute=False, resul
                 try:
                     train_motion_model(
                         model, train_loader, val_loader,
-                        epochs=3, lr=1e-3, gradient_clip=1.0,
-                        teacher_forcing_ratio=0.5, scheduled_sampling_decay=0.2,
+                        epochs=5, lr=1e-3, gradient_clip=1.0,
+                        teacher_forcing_ratio=1.0, scheduled_sampling_decay=0.0,
                         save_path=save_path, device=device, verbose=False
                     )
                     tracker = RNNMotionTracker(save_path, iou_threshold=0.3, max_lost_frames=15, device=device)

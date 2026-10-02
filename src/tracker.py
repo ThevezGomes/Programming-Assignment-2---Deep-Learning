@@ -197,8 +197,8 @@ class RNNTrack:
         """Converte de [cx, cy, w, h] normalizado para [x, y, w, h] em pixels."""
         cx = float(box_norm[0]) * self.im_w
         cy = float(box_norm[1]) * self.im_h
-        w = float(box_norm[2]) * self.im_w
-        h = float(box_norm[3]) * self.im_h
+        w = max(1.0, float(box_norm[2]) * self.im_w)
+        h = max(1.0, float(box_norm[3]) * self.im_h)
         x = cx - w / 2.0
         y = cy - h / 2.0
         return np.array([x, y, w, h], dtype=np.float32)
