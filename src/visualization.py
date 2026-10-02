@@ -548,8 +548,7 @@ def plot_ablation_eixo1(results_path: str = "results/ablation_eixo1.json", save_
     ax.set_xticks([4, 8, 16, 32])
     ax.set_xlabel("Comprimento da Janela de BPTT (T quadros)", fontsize=11, fontweight="bold")
     ax.set_ylabel("Média do IDF1 (MOT17-09)", fontsize=11, fontweight="bold")
-    ax.set_title("Parte 3 (Eixo 1) — Ablação da Célula Recorrente e Janela de BPTT\n"
-                 "(RNN Simples colapsa em janelas longas por Vanishing Gradient)", fontsize=12, fontweight="bold")
+    ax.set_title("Parte 3 (Eixo 1) — Ablação da Célula Recorrente e Janela de BPTT\n", fontsize=12, fontweight="bold")
     
     ax.legend(title="Arquitetura\n(~35k parâmetros)", framealpha=0.9)
     ax.grid(axis="y", linestyle="--", alpha=0.6)
@@ -585,8 +584,7 @@ def plot_stress_detector_results(results: list, seq_name: str = "MOT17-09", save
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
     fig.suptitle(
-        f"Parte 5 — Teste de Estresse da Qualidade do Detector ({seq_name})\n"
-        "O Modelo Temporal Recorrente (LSTM) Absorve Falhas do Detector e Sustenta a Identidade",
+        f"Parte 5 — Teste de Estresse da Qualidade do Detector ({seq_name})",
         fontsize=12, fontweight="bold", y=1.03
     )
 
@@ -627,7 +625,7 @@ def plot_stress_detector_results(results: list, seq_name: str = "MOT17-09", save
 
     ax2.set_xlabel("mAP por Quadro (Qualidade do Detector)", fontsize=10, fontweight="bold")
     ax2.set_ylabel("IDF1 (Consistência Temporal)", fontsize=10, fontweight="bold")
-    ax2.set_title("2. Descolamento mAP vs IDF1\n(LSTM possui menor taxa de perda)", fontsize=11, fontweight="bold")
+    ax2.set_title("2. Descolamento mAP vs IDF1", fontsize=11, fontweight="bold")
     ax2.grid(True, linestyle=":", alpha=0.6)
     ax2.legend(loc="lower right", fontsize=9)
 
@@ -648,7 +646,7 @@ def plot_stress_detector_results(results: list, seq_name: str = "MOT17-09", save
     ax3.set_xticklabels(levels, fontweight="bold")
     ax3.set_xlabel("Intensidade de Degradação", fontsize=10, fontweight="bold")
     ax3.set_ylabel("Número de ID Switches", fontsize=10, fontweight="bold")
-    ax3.set_title("3. Contagem de ID Switches\n(LSTM reduz fragmentações espúrias)", fontsize=11, fontweight="bold")
+    ax3.set_title("3. Contagem de ID Switches", fontsize=11, fontweight="bold")
     ax3.grid(axis="y", linestyle=":", alpha=0.6)
     ax3.legend(loc="upper left", fontsize=9)
 

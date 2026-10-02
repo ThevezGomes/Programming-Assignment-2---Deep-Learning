@@ -155,7 +155,7 @@ def run_detector_stress_experiment(
     print(f"Sequência: {seq_name} ({im_w}x{im_h}) | Checkpoint: {os.path.basename(model_path)}")
     print(f"Configuração LSTM: velocity_damping={velocity_damping}, sigma_inflation={sigma_inflation}")
     print(SEP)
-    header = f"{'Nível':<10} | {'mAP (Det)':<9} | {'IDF1 (Naive)':<12} | {'IDF1 (LSTM)':<11} | {'Delta IDF1':<10} | {'IDSW (N/L)':<10} | {'Diagnóstico'}"
+    header = f"{'Nível':<10} | {'mAP (Det)':<9} | {'IDF1 (Naive)':<12} | {'IDF1 (LSTM)':<11} | {'Delta IDF1':<10} | {'IDSW (N/L)':<10}"
     print(header)
     print("-" * 94)
 
@@ -207,7 +207,7 @@ def run_detector_stress_experiment(
             diag = "Amplificação do erro"
 
         idsw_str = f"{m_naive['id_switches']}/{m_lstm['id_switches']}"
-        print(f"{lvl['level']:<10} | {map_score:<9.3f} | {m_naive['idf1']:<12.3f} | {m_lstm['idf1']:<11.3f} | {delta_idf1:+10.3f} | {idsw_str:<10} | {diag}")
+        print(f"{lvl['level']:<10} | {map_score:<9.3f} | {m_naive['idf1']:<12.3f} | {m_lstm['idf1']:<11.3f} | {delta_idf1:+10.3f} | {idsw_str:<10}")
 
         entry = {
             "level": lvl["level"],
@@ -230,8 +230,7 @@ def run_detector_stress_experiment(
                 "ratio_ids": float(m_lstm["ratio_ids"])
             },
             "delta_idf1": float(delta_idf1),
-            "delta_idsw": int(delta_idsw),
-            "diagnostico": diag
+            "delta_idsw": int(delta_idsw)
         }
         results_table.append(entry)
 
