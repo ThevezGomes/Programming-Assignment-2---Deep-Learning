@@ -57,8 +57,8 @@ def run_synthetic_breakdown(
     print(SEP)
     print("TABELA 0: BASELINE NO CENARIO SINTETICO — Curva de Quebra")
     print(SEP)
-    print("{:<12} | {:<10} | {:<8} | {:<6} | {:<10} | {}".format(
-        "Degradacao", "mAP (Det)", "IDF1", "IDSW", "Razao IDs", "Diagnostico"
+    print("{:<12} | {:<10} | {:<8} | {:<6} | {:<10}".format(
+        "Degradacao", "mAP (Det)", "IDF1", "IDSW", "Razao IDs"
     ))
     print("-" * 75)
 
@@ -79,15 +79,8 @@ def run_synthetic_breakdown(
         m = evaluate_tracking(gt_by_frame, preds)
         mp = compute_map_per_frame(gt_by_frame, det)
 
-        if lvl["label"] == "Perfeito":
-            note = "Piso facil: tracker correto (IDF1=1.0)"
-        elif lvl["label"] == "Moderado":
-            note = "IDF1 cai antes do mAP — descolamento!"
-        else:
-            note = ""
-
-        print("{:<12} | {:<10.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x | {}".format(
-            lvl["label"], mp, m["idf1"], m["id_switches"], m["ratio_ids"], note
+        print("{:<12} | {:<10.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x".format(
+            lvl["label"], mp, m["idf1"], m["id_switches"], m["ratio_ids"]
         ))
 
         results.append({
@@ -127,8 +120,8 @@ def run_generator_knobs_breakdown(
 
     # 1. BOTAO: VELOCIDADE
     print("\n--- 1. BOTAO: VELOCIDADE TYPICAL (num_objects=5, sem oclusao prolongada) ---")
-    print("{:<12} | {:<8} | {:<6} | {:<8} | {:<10} | {}".format(
-        "Vel (px/f)", "IDF1", "IDSW", "Frag", "Razao IDs", "Diagnostico"
+    print("{:<12} | {:<8} | {:<6} | {:<8} | {:<10}".format(
+        "Vel (px/f)", "IDF1", "IDSW", "Frag", "Razao IDs"
     ))
     print("-" * 78)
     vel_results = []
@@ -141,16 +134,15 @@ def run_generator_knobs_breakdown(
         tracker.reset()
         preds = tracker.track_sequence(gt)
         m = evaluate_tracking(gt, preds, iou_threshold=iou_threshold)
-        note = "Piso facil (ok)" if v <= 2.5 else ("IoU falha (v > caixa)" if v >= 8.0 else "Instabilidade")
-        print("{:<12.1f} | {:<8.3f} | {:<6d} | {:<8d} | {:<9.2f}x | {}".format(
-            v, m["idf1"], m["id_switches"], m["fragmentations"], m["ratio_ids"], note
+        print("{:<12.1f} | {:<8.3f} | {:<6d} | {:<8d} | {:<9.2f}x".format(
+            v, m["idf1"], m["id_switches"], m["fragmentations"], m["ratio_ids"]
         ))
         vel_results.append({"velocity": v, **m})
 
     # 2. BOTAO: DURACAO DA OCLUSAO
     print(f"\n--- 2. BOTAO: DURACAO DA OCLUSAO (k_max_lost={max_lost_frames} quadros) ---")
-    print("{:<12} | {:<8} | {:<6} | {:<8} | {:<10} | {}".format(
-        "Oclusao (f)", "IDF1", "IDSW", "Frag", "Razao IDs", "Diagnostico"
+    print("{:<12} | {:<8} | {:<6} | {:<8} | {:<10}".format(
+        "Oclusao (f)", "IDF1", "IDSW", "Frag", "Razao IDs"
     ))
     print("-" * 78)
     occ_results = []
@@ -162,16 +154,15 @@ def run_generator_knobs_breakdown(
         tracker.reset()
         preds = tracker.track_sequence(gt)
         m = evaluate_tracking(gt, preds, iou_threshold=iou_threshold)
-        note = "Track sobrevive (occ <= k)" if occ <= max_lost_frames else "Track MORRE e troca ID (occ > k)!"
-        print("{:<12d} | {:<8.3f} | {:<6d} | {:<8d} | {:<9.2f}x | {}".format(
-            occ, m["idf1"], m["id_switches"], m["fragmentations"], m["ratio_ids"], note
+        print("{:<12d} | {:<8.3f} | {:<6d} | {:<8d} | {:<9.2f}x".format(
+            occ, m["idf1"], m["id_switches"], m["fragmentations"], m["ratio_ids"]
         ))
         occ_results.append({"occlusion": occ, **m})
 
     # 3. BOTAO: NUMERO DE OBJETOS / DENSIDADE
     print("\n--- 3. BOTAO: NUMERO DE OBJETOS / DENSIDADE (vel=2.0 px/frame) ---")
-    print("{:<12} | {:<8} | {:<6} | {:<8} | {:<10} | {}".format(
-        "Objetos", "IDF1", "IDSW", "Frag", "Razao IDs", "Diagnostico"
+    print("{:<12} | {:<8} | {:<6} | {:<8} | {:<10}".format(
+        "Objetos", "IDF1", "IDSW", "Frag", "Razao IDs"
     ))
     print("-" * 78)
     obj_results = []
@@ -184,9 +175,8 @@ def run_generator_knobs_breakdown(
         tracker.reset()
         preds = tracker.track_sequence(gt)
         m = evaluate_tracking(gt, preds, iou_threshold=iou_threshold)
-        note = "Cena limpa" if n <= 6 else ("Aglomeracao e trocas" if n >= 13 else "Cruzamentos")
-        print("{:<12d} | {:<8.3f} | {:<6d} | {:<8d} | {:<9.2f}x | {}".format(
-            n, m["idf1"], m["id_switches"], m["fragmentations"], m["ratio_ids"], note
+        print("{:<12d} | {:<8.3f} | {:<6d} | {:<8d} | {:<9.2f}x".format(
+            n, m["idf1"], m["id_switches"], m["fragmentations"], m["ratio_ids"]
         ))
         obj_results.append({"num_objects": n, **m})
 
@@ -221,8 +211,8 @@ def run_synthetic_table(
     print(SEP)
     print("TABELA 1.0: BASELINE NO CENARIO SINTETICO (Parte 0 -> Parte 1)")
     print(SEP)
-    print("{:<12} | {:<10} | {:<8} | {:<6} | {:<10} | {}".format(
-        "Degradacao", "mAP (Det)", "IDF1", "IDSW", "Razao IDs", "Diagnostico"
+    print("{:<12} | {:<10} | {:<8} | {:<6} | {:<10}".format(
+        "Degradacao", "mAP (Det)", "IDF1", "IDSW", "Razao IDs"
     ))
     print("-" * 75)
 
@@ -241,15 +231,8 @@ def run_synthetic_table(
         m = evaluate_tracking(gt_by_frame, preds)
         mp = compute_map_per_frame(gt_by_frame, det)
 
-        if lvl["label"] == "Perfeito":
-            note = "Piso facil: tracker correto"
-        elif lvl["label"] == "Moderado":
-            note = "IDF1 cai antes do mAP — descolamento!"
-        else:
-            note = ""
-
-        print("{:<12} | {:<10.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x | {}".format(
-            lvl["label"], mp, m["idf1"], m["id_switches"], m["ratio_ids"], note
+        print("{:<12} | {:<10.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x".format(
+            lvl["label"], mp, m["idf1"], m["id_switches"], m["ratio_ids"]
         ))
 
         results.append({
@@ -284,8 +267,8 @@ def run_detector_comparison(
     print(SEP)
     print(f"TABELA 1.1: FONTES PUBLICAS NO MOT17-{seq_id} (ESCOLHA DO DETECTOR PADRAO)")
     print(SEP)
-    print("{:<8} | {:<10} | {:<8} | {:<12} | {:<9} | {}".format(
-        "Fonte", "mAP (Det)", "IDF1", "ID Switches", "Pred IDs", "Diagnostico / Escolha"
+    print("{:<8} | {:<10} | {:<8} | {:<12} | {:<9}".format(
+        "Fonte", "mAP (Det)", "IDF1", "ID Switches", "Pred IDs"
     ))
     print("-" * 75)
 
@@ -314,15 +297,12 @@ def run_detector_comparison(
         else:
             status = "Conservador"
 
-        print("{:<8} | {:<10.3f} | {:<8.3f} | {:<12d} | {:<9d} | {}".format(
-            det_name, mp, m["idf1"], m["id_switches"], m["unique_pred_ids"], status
+        print("{:<8} | {:<10.3f} | {:<8.3f} | {:<12d} | {:<9d}".format(
+            det_name, mp, m["idf1"], m["id_switches"], m["unique_pred_ids"]
         ))
 
         results.append({"det_name": det_name, "map_score": mp, **m})
 
-    print(SEP)
-    print("Justificativa: SDP tem maior mAP (~0.75), isolando o gargalo no tracker e nao no detector.")
-    print(SEP + "\n")
     return results
 
 
@@ -420,13 +400,12 @@ def compare_detection_sources(
     print("\n" + SEP)
     print("COMPARACAO DAS DUAS FONTES NO DOMINIO SINTETICO")
     print(SEP)
-    print("{:<40} | {:<12} | {}".format("Fonte", "Deteccoes", "Tracking possivel?"))
+    print("{:<40} | {:<12}".format("Fonte", "Deteccoes"))
     print("-" * 65)
-    print("{:<40} | {:<12} | {}".format(
-        "Fonte 1 — Publicas/Simul. (SDP-like)", n1, "Sim (IDF1=1.0 no piso facil)"))
-    print("{:<40} | {:<12} | {}".format(
-        "Fonte 2 — Torchvision Faster R-CNN", n2,
-        "Nao — gap de dominio (elipses != pessoas)"))
+    print("{:<40} | {:<12}".format(
+        "Fonte 1 — Publicas/Simul. (SDP-like)", n1))
+    print("{:<40} | {:<12}".format(
+        "Fonte 2 — Torchvision Faster R-CNN", n2))
 
     return {
         "frames": frames,
@@ -500,17 +479,17 @@ def compare_real_detection_sources(
     print("\n" + SEP)
     print(f"TABELA 1.1b: COMPARACAO DAS DUAS FONTES EM DADOS REAIS ({os.path.basename(seq_path)})")
     print(SEP)
-    print("{:<28} | {:<9} | {:<8} | {:<6} | {:<10} | {}".format(
-        "Fonte de Detecção", "mAP (Det)", "IDF1", "IDSW", "Razao IDs", "Diagnostico"
+    print("{:<28} | {:<9} | {:<8} | {:<6} | {:<10}".format(
+        "Fonte de Detecção", "mAP (Det)", "IDF1", "IDSW", "Razao IDs"
     ))
     print("-" * 80)
-    print("{:<28} | {:<9.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x | {}".format(
+    print("{:<28} | {:<9.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x".format(
         "Fonte 1 — Publica (SDP)", map_sdp, m_sdp["idf1"], m_sdp["id_switches"],
-        m_sdp["ratio_ids"], "Especializado em pedestres MOT"
+        m_sdp["ratio_ids"]
     ))
-    print("{:<28} | {:<9.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x | {}".format(
+    print("{:<28} | {:<9.3f} | {:<8.3f} | {:<6d} | {:<9.2f}x".format(
         "Fonte 2 — Faster R-CNN (COCO)", map_rcnn, m_rcnn["idf1"], m_rcnn["id_switches"],
-        m_rcnn["ratio_ids"], "Detector COCO + custom_nms"
+        m_rcnn["ratio_ids"]
     ))
 
     return {

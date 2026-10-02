@@ -441,9 +441,4 @@ def run_unit_tests(verbose: bool = True):
         print(f"       ID Switches    = {res_c['id_switches']}  (esperado: 1)")
         print(f"       IDs GT / Pred  = {res_c['unique_gt_ids']} GT / {res_c['unique_pred_ids']} Pred")
 
-    if verbose:
-        print(f"\n{SEP}")
-        print("TODOS OS TESTES APROVADOS!" if all_passed else "ATENCAO: ALGUM TESTE FALHOU!")
-        print(SEP)
-
     return all_passed
