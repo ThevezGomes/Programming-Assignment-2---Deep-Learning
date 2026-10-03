@@ -546,9 +546,6 @@ def demonstrate_fix(
             pid_depois_aft = pid
             break
     recovered = (pid_depois_aft == pid_original)
-    print(f"\n  Verificação específica (GT:{gt_id}, frame {f_aft}):")
-    print(f"    ANTES:  Pred:{case['pid_after']} (ID trocado)")
-    print(f"    DEPOIS: Pred:{pid_depois_aft} ({'✓ ID RECUPERADO!' if recovered else 'ainda trocado — correção parcial'})")
 
     fig, axes = plt.subplots(2, len(frames), figsize=(3.0 * len(frames), 7.5))
 
@@ -569,25 +566,6 @@ def demonstrate_fix(
         f"ID Switches: {m_antes['id_switches']} → {m_depois['id_switches']} ({delta_sw:+d})",
         fontsize=10, fontweight="bold"
     )
-
-    if delta_sw < 0:
-        conclusion = (
-            f"A correção reduziu os ID Switches em {abs(delta_sw)} e {'melhorou' if delta_idf1 > 0 else 'manteve'} "
-            f"o IDF1 em {delta_idf1:+.4f}. O portão adaptativo proporcional ao tempo de oclusão "
-            "baixou o threshold de 0.30 → 0.10 após 25 frames perdidos, reasociando a detecção "
-            "(IoU=0.855) à track original mesmo com o pred em IoU=0.179."
-        )
-    else:
-        conclusion = (
-            "A correção não alterou os ID Switches globais: embora recupere esta falha específica, "
-            "o threshold mais baixo também aceita associações erradas em outros casos, "
-            "equilibrando o resultado. O diagnóstico correto indica que a correção deve ser "
-            "aplicada SOMENTE a tracks com oclusão longa E com detector presente (IoU > 0), "
-            "não globalmente — uma lógica mais cirúrgica que está além do escopo deste PA."
-        )
-
-    fig.text(0.5, 0.01, conclusion, ha="center", fontsize=7.5,
-             bbox=dict(facecolor="#fffde7", edgecolor="#cccc00", alpha=0.9, pad=5))
 
     plt.tight_layout(rect=[0, 0.08, 1, 1])
     save_path = os.path.join(save_dir, "parte4_antes_depois_correcao.png")
